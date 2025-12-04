@@ -1,0 +1,55 @@
+{
+    "source_conn_params": {
+         "dbname": "PathKind_BPHT",
+         "user": "sa45204",
+         "password": "Labsoul@2024oooo",
+         "host": "localhost",
+         "port": "2222"
+    },
+    "kafka_broker": "172.16.1.30:9095",
+    "tables": {
+        "dbo.Patient_Details": {
+            "check_dbstatus": false,
+            "exclude_columns": []
+        },
+        "dbo.Orders": {
+            "check_dbstatus": true,
+            "exclude_columns": []
+        },
+        "dbo.Test_Parameters": {
+            "check_dbstatus": true,
+            "exclude_columns": ["CentralResultID"]
+        },
+        "dbo.UtilityException": {
+            "check_dbstatus": false,
+            "exclude_columns": []
+        },
+        "dbo.ProductAuth_Table": {
+            "check_dbstatus": false,
+            "exclude_columns": []
+        },
+        "dbo.Users": {
+            "check_dbstatus": false,
+            "exclude_columns": []
+        },
+        "dbo.ExtTestCodeConfiguration": {
+            "check_dbstatus": false,
+            "exclude_columns": []
+        },
+        "dbo.LogException": {
+            "check_dbstatus": false,
+            "exclude_columns": []
+        },
+        "dbo.Machine": {
+            "check_dbstatus": false,
+            "exclude_columns": []
+        },
+        "dbo.LocationMaster": {
+            "check_dbstatus": false,
+            "exclude_columns": []
+        }
+    },
+"producer_id": "172.23.4.3",
+    "producer_name": "FaridabadHLM",
+    "location_id": "222"
+}
