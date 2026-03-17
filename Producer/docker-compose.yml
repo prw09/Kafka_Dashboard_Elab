@@ -1,0 +1,12 @@
+version: "3.8"
+
+services:
+  producer:
+    build: .
+    container_name: producer
+    restart: always
+    volumes:
+      - ./logs:/app/logs
+      - ./config.json:/app/config.json
+    environment:
+      - TZ=Asia/Kolkata

@@ -170,10 +170,18 @@ def fetch_and_send_data(table_name, kafka_producer, check_dbstatus=False, exclud
 
         for row in rows:
             record = {
-                col: (val.isoformat() if isinstance(val, datetime) else val)
+                col: val
                 for col, val in zip(columns, row)
                 if col not in exclude_columns
             }
+
+            # Debug: log actual JSON being sent
+            json_data = json.dumps(record, default=json_serializer)
+            source_logger.info(f"ACTUAL JSON SENT: {json_data}")
+            print(f"ACTUAL JSON SENT: {json_data}")
+
+            # future = kafka_producer.send(table_name, record)
+            # future.get(timeout=10)
 
             future = kafka_producer.send(table_name, record)
             future.get(timeout=10)  # wait for ACK
@@ -254,13 +262,13 @@ if __name__ == "__main__":
     # 1. Create a single producer for heartbeat
     heartbeat_producer = KafkaProducer(
         bootstrap_servers=kafka_broker,
-        value_serializer=lambda v: json.dumps(v).encode('utf-8')
+        value_serializer=lambda v: json.dumps(v, default=json_serializer).encode('utf-8')
     )
 
     # 2. Create a single producer for all table data
     data_producer = KafkaProducer(
         bootstrap_servers=kafka_broker,
-        value_serializer=lambda v: json.dumps(v).encode('utf-8')
+        value_serializer=lambda v: json.dumps(v, default=json_serializer).encode('utf-8')
     )
 
     # Start heartbeat thread
