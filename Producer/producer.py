@@ -9,6 +9,8 @@ import sys
 import signal
 import threading
 from logging.handlers import TimedRotatingFileHandler
+from datetime import datetime, date
+from decimal import Decimal
 # import win32serviceutil
 # import win32service
 # import win32event
@@ -91,6 +93,18 @@ except KeyError as e:
     sys.exit(1)
 
 # -----------------------------
+# Json Serialization
+# -----------------------------
+
+def json_serializer(obj):
+    if isinstance(obj, (datetime, date)):
+        return obj.isoformat()
+    if isinstance(obj, Decimal):
+        return float(obj)
+    return obj
+
+
+# -----------------------------
 # Heartbeat producer
 # -----------------------------
 def send_heartbeat(producer_id, producer_name, location_id, kafka_producer):
@@ -109,6 +123,7 @@ def send_heartbeat(producer_id, producer_name, location_id, kafka_producer):
         print(f"Sent heartbeat: {heartbeat_message}")
 
         time.sleep(10)  # heartbeat every 10 seconds
+
 
 # -----------------------------
 # Data fetch and send
@@ -236,6 +251,7 @@ def delete_old_logs():
 # Main application
 # -----------------------------
 if __name__ == "__main__":
+
     # 1. Create a single producer for heartbeat
     heartbeat_producer = KafkaProducer(
         bootstrap_servers=kafka_broker,
