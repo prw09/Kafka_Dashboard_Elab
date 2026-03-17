@@ -9,10 +9,10 @@ import sys
 import signal
 import threading
 from logging.handlers import TimedRotatingFileHandler
-import win32serviceutil
-import win32service
-import win32event
-import servicemanager
+# import win32serviceutil
+# import win32service
+# import win32event
+# import servicemanager
 
 
 # -----------------------------
