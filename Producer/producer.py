@@ -103,7 +103,6 @@ def json_serializer(obj):
         return float(obj)
     return obj
 
-
 # -----------------------------
 # Heartbeat producer
 # -----------------------------
