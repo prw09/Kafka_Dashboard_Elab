@@ -9,6 +9,10 @@ import sys
 import signal
 import threading
 from logging.handlers import TimedRotatingFileHandler
+# import win32serviceutil
+# import win32service
+# import win32event
+# import servicemanager
 
 # Global variable to control the running state
 running = True
