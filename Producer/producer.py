@@ -1,211 +1,145 @@
+check this 
+
 import json
 import pyodbc
 import logging
 import os
 from kafka import KafkaProducer
-from datetime import datetime, timedelta
+from kafka import KafkaConsumer
+from datetime import datetime, timedelta, date
 import time
 import sys
 import signal
 import threading
 from logging.handlers import TimedRotatingFileHandler
+from decimal import Decimal
+
 # import win32serviceutil
 # import win32service
 # import win32event
 # import servicemanager
 
-# Global variable to control the running state
+
+
+# -----------------------------
+# Global variable to control running state
+# -----------------------------
 running = True
 
-# Initialize constants for logging
-LOG_BACKUP_COUNT = 30  # keep 30 days of logs
-LOG_FLUSH_INTERVAL_SECONDS = 24 * 3600  # flush logs every 24 hours
+DELETE_LOGS_OLDER_THAN_HOURS = 8
+LOG_DELETE_INTERVAL_SECONDS = 24 * 60 * 60  # 1 day
 
-# Determine the execution directory
+
+# -----------------------------
+# Signal handling
+# -----------------------------
+def handle_signal(sig, frame):
+    global running
+    source_logger.info("Received termination signal, shutting down gracefully...")
+    print("\nShutting down gracefully...")
+    running = False
+
+signal.signal(signal.SIGINT, handle_signal)
+signal.signal(signal.SIGTERM, handle_signal)
+
+# -----------------------------
+# Determine execution directory
+# -----------------------------
 if getattr(sys, 'frozen', False):
     exe_dir = os.path.dirname(sys.executable)
 else:
     exe_dir = os.path.dirname(os.path.abspath(__file__))
 
-# Setup logging directory
+# -----------------------------
+# Setup logging
+# -----------------------------
 logs_dir = os.path.join(exe_dir, 'logs')
-if not os.path.exists(logs_dir):
-    os.makedirs(logs_dir, exist_ok=True)
+os.makedirs(logs_dir, exist_ok=True)
+log_file_path = os.path.join(logs_dir, "producer.log")
 
-# We will create a subdirectory per day (YYYY-MM-DD). Inside that directory,
-# we keep a single active file (producer.log) which will be rotated every 6 hours
-# producing up to 4 files per day.
-current_day = datetime.now().strftime('%Y-%m-%d')
+handler = TimedRotatingFileHandler(
+    log_file_path,
+    when="H",
+    interval=1,
+    backupCount=0,   # keep all rotated logs
+    encoding="utf-8"
+)
+handler.suffix = "%Y%m%d_%H.log"
 
-def _make_day_log_dir(day_str: str):
-    day_dir = os.path.join(logs_dir, day_str)
-    os.makedirs(day_dir, exist_ok=True)
-    return day_dir
-
-# Global handler container so we can replace it when day changes
-handler = None
-
-# Create/replace the file handler for the current day
-def _setup_log_handler_for_day(day_str: str):
-    global handler
-    day_dir = _make_day_log_dir(day_str)
-    log_file_path = os.path.join(day_dir, "producer.log")
-
-    # Remove existing handler if present
-    root_logger = logging.getLogger('source_db_logger')
-    if handler is not None:
-        try:
-            root_logger.removeHandler(handler)
-            handler.close()
-        except Exception:
-            pass
-
-    # Rotate every 6 hours (interval=6, when='h')
-    new_handler = TimedRotatingFileHandler(
-        log_file_path,
-        when='M',
-        interval=5,
-        backupCount=288,
-        encoding='utf-8'
-    )
-    # Suffix will include date and hour so rotated files are like producer.log.YYYY-MM-DD_HH-MM-SS.log
-    new_handler.suffix = "%Y-%m-%d_%H-%M-%S.log"
-    new_handler.setFormatter(logging.Formatter('%(asctime)s %(levelname)s %(message)s'))
-
-    handler = new_handler
-    root_logger.addHandler(handler)
-
-# Initialize logger
 source_logger = logging.getLogger('source_db_logger')
 source_logger.setLevel(logging.DEBUG)
+formatter = logging.Formatter('%(asctime)s %(levelname)s %(message)s')
+handler.setFormatter(formatter)
+source_logger.addHandler(handler)
 
-# run initial setup
-_setup_log_handler_for_day(current_day)
-
-# Background thread to watch for day rollover and reconfigure logging to a new folder
-def _watch_day_rollover():
-    global current_day
-    while running:
-        now_day = datetime.now().strftime('%Y-%m-%d')
-        if now_day != current_day:
-            # day changed — set up a new handler for the new day
-            try:
-                current_day = now_day
-                _setup_log_handler_for_day(current_day)
-                source_logger.info(f"Log handler moved to new day folder: {current_day}")
-            except Exception as e:
-                # don't let the watcher thread crash
-                print(f"Failed to rotate log handler for new day: {e}")
-        # Check once a minute
-        for _ in range(60):
-            if not running:
-                break
-            time.sleep(1)
-
-# Ensure logs are flushed to disk periodically (handler.flush() is called on each emit,
-# but we also run a daily flush/rotate thread to satisfy the "flush every 1 day" requirement)
-def _periodic_log_flush():
-    while running:
-        try:
-            if handler is not None:
-                handler.flush()
-        except Exception:
-            # Avoid raising in the logging thread
-            pass
-        # Sleep for 24 hours, but wake up earlier if shutting down
-        for _ in range(24 * 3600):
-            if not running:
-                break
-            time.sleep(1)
-
-    while running:
-        try:
-            # flush the handler and trigger rotation check
-            handler.flush()
-        except Exception:
-            # Avoid raising in the logging thread
-            pass
-        # Sleep for the configured interval
-        for _ in range(int(LOG_FLUSH_INTERVAL_SECONDS / 1)):
-            if not running:
-                break
-            time.sleep(1)
-
+# -----------------------------
 # Load configuration
+# -----------------------------
 config_file_path = os.path.join(exe_dir, 'config.json')
 try:
     with open(config_file_path, 'r') as config_file:
         config = json.load(config_file)
 except Exception as e:
     source_logger.error(f"Error loading configuration file: {e}")
+    print(f"Error loading configuration file: {e}")
     sys.exit(1)
 
 try:
     source_conn_params = config["source_conn_params"]
     kafka_broker = config["kafka_broker"]
     tables = config["tables"]
-    producer_id = config.get("producer_id")
-    producer_name = config.get("producer_name")
-    location_id = config.get("location_id")
+    producer_id = config["producer_id"]
+    producer_name = config["producer_name"]
+    location_id = config["location_id"]
 except KeyError as e:
     source_logger.error(f"Missing required configuration key: {e}")
+    print(f"Missing required configuration key: {e}")
     sys.exit(1)
 
-# Signal handling to shut down gracefully
-def handle_signal(sig, frame):
-    global running
-    source_logger.info("Received termination signal, shutting down gracefully...")
-    running = False
+# -----------------------------
+# Json Serialization
+# -----------------------------
 
-signal.signal(signal.SIGINT, handle_signal)
-signal.signal(signal.SIGTERM, handle_signal)
+def json_serializer(obj):
+    if isinstance(obj, (datetime, date)):
+        return obj.isoformat()
+    if isinstance(obj, Decimal):
+        return float(obj)
+    return obj
 
-# Heartbeat thread
-def send_heartbeat(producer_id, producer_name, location_id, kafka_broker, interval_seconds=30):
+# -----------------------------
+# Heartbeat producer
+# -----------------------------
+def send_heartbeat(producer_id, producer_name, location_id, kafka_producer):
     heartbeat_topic = 'producer_heartbeat'
-    kafka_producer = None
-    try:
-        kafka_producer = KafkaProducer(
-            bootstrap_servers=kafka_broker,
-            value_serializer=lambda v: json.dumps(v).encode('utf-8')
-        )
 
-        while running:
-            heartbeat_message = {
-                'producer_id': producer_id,
-                'producer_name': producer_name,
-                'location_id': location_id,
-                'timestamp': datetime.now().isoformat()
-            }
-            try:
-                kafka_producer.send(heartbeat_topic, heartbeat_message)
-                kafka_producer.flush(timeout=10)
-                source_logger.debug(f"Sent heartbeat: {heartbeat_message}")
-            except Exception as e:
-                source_logger.error(f"Failed to send heartbeat: {e}")
+    while running:
+        heartbeat_message = {
+            'producer_id': producer_id,
+            'producer_name': producer_name,
+            'location_id': location_id,
+            'timestamp': datetime.now().isoformat()
+        }
 
-            for _ in range(int(interval_seconds / 1)):
-                if not running:
-                    break
-                time.sleep(1)
-    except Exception as e:
-        source_logger.error(f"Heartbeat thread failed to start: {e}")
-    finally:
-        if kafka_producer:
-            try:
-                kafka_producer.close()
-            except Exception:
-                pass
+        kafka_producer.send(heartbeat_topic, heartbeat_message)
+        source_logger.debug(f"Sent heartbeat: {heartbeat_message}")
+        print(f"Sent heartbeat: {heartbeat_message}")
 
-# Function to fetch and send data from the database to Kafka
-def fetch_and_send_data(table_name, check_dbstatus=False, exclude_columns=None):
-    if exclude_columns is None:
-        exclude_columns = []
+        time.sleep(10)  # heartbeat every 10 seconds
+
+
+# -----------------------------
+# Data fetch and send
+# -----------------------------
+def fetch_and_send_data(table_name, kafka_producer, check_dbstatus=False, exclude_columns=None):
+    exclude_columns = exclude_columns or []
 
     source_logger.debug(f"Connecting to source database for table {table_name}")
+    print(f"Connecting to source database for table {table_name}")
+
     conn = None
     cursor = None
-    kafka_producer = None
+
     try:
         conn_str = (
             f"DRIVER={{ODBC Driver 13 for SQL Server}};"
@@ -214,123 +148,235 @@ def fetch_and_send_data(table_name, check_dbstatus=False, exclude_columns=None):
             f"UID={source_conn_params['user']};"
             f"PWD={source_conn_params['password']}"
         )
+
         conn = pyodbc.connect(conn_str)
         cursor = conn.cursor()
+
         source_logger.info(f"Connected to source database to fetch data from {table_name}")
 
-        seven_days_ago = (datetime.now() - timedelta(days=3)).strftime('%Y-%m-%d')
+        three_days_ago = (datetime.now() - timedelta(days=3)).strftime('%Y-%m-%d')
+
+        # Build query
         if table_name == "dbo.Patient_Details":
-            query = f"SELECT * FROM {table_name} WHERE (issync = 0) AND CreateDate >= '{seven_days_ago}'"
+            query = f"SELECT * FROM {table_name} WHERE issync = 0 AND CreateDate >= '{three_days_ago}'"
         elif table_name in ["dbo.Orders", "dbo.Test_Parameters"]:
-            query = f"SELECT * FROM {table_name} WHERE (issync = 0) AND CreatedDate >= '{seven_days_ago}'"
+            query = f"SELECT * FROM {table_name} WHERE issync = 0 AND CreatedDate >= '{three_days_ago}'"
         elif table_name == "dbo.UtilityException":
-            query = f"SELECT * FROM {table_name} WHERE (issync = 0) AND Timestamp >= '{seven_days_ago}'"
+            query = f"SELECT * FROM {table_name} WHERE issync = 0 AND Timestamp >= '{three_days_ago}'"
         else:
-            query = f"SELECT * FROM {table_name} WHERE (issync = 0)"
+            query = f"SELECT * FROM {table_name} WHERE issync = 0"
 
         if check_dbstatus:
             query += " AND DbStatus BETWEEN 1 AND 5"
 
         cursor.execute(query)
         rows = cursor.fetchall()
+
+        if not rows:
+            source_logger.info(f"No records found for {table_name}")
+            return
+
         columns = [desc[0] for desc in cursor.description]
 
-        kafka_producer = KafkaProducer(
-            bootstrap_servers=kafka_broker,
-            value_serializer=lambda v: json.dumps(v).encode('utf-8')
-        )
+        source_logger.info(f"Fetched {len(rows)} records from {table_name}")
 
         for row in rows:
-            record = {}
-            for col, val in zip(columns, row):
-                if col in exclude_columns:
-                    continue
-                if isinstance(val, datetime):
-                    record[col] = val.isoformat()
-                else:
-                    try:
-                        # pyodbc may return Decimal/other types - let json handle or convert
-                        record[col] = val
-                    except Exception:
-                        record[col] = str(val)
-
-            # Send record to kafka
             try:
-                kafka_producer.send(table_name, record)
-                source_logger.debug(f"Sent record to Kafka: {record}")
-            except Exception as e:
-                source_logger.error(f"Failed to send record to Kafka: {e}")
+                record = {
+                    col: val
+                    for col, val in zip(columns, row)
+                    if col not in exclude_columns
+                }
 
-            # Update issync flag using primary key
-            try:
-                primary_key_column = 'ResultID' if 'ResultID' in columns else columns[0]
-                if primary_key_column in record and record[primary_key_column] is not None:
-                    update_query = f"UPDATE {table_name} SET issync = 1 WHERE {primary_key_column} = ?"
-                    cursor.execute(update_query, (record[primary_key_column],))
-                    conn.commit()
-                    source_logger.debug(f"Updated issync for record with {primary_key_column}: {record[primary_key_column]}")
-                else:
-                    source_logger.debug(f"Primary key {primary_key_column} missing in record; skipping issync update")
-            except Exception as e:
-                source_logger.error(f"Failed to update issync for record: {e}")
+                json_data = json.dumps(record, default=json_serializer)
+                source_logger.debug(f"SENDING: {json_data}")
 
-        kafka_producer.flush()
-        source_logger.info(f"Successfully fetched and sent data from {table_name}")
+                # Send to Kafka
+                future = kafka_producer.send(table_name, record)
+                future.get(timeout=10)
+
+                source_logger.debug(f"Sent record successfully")
+
+                # Small delay to avoid flooding
+                time.sleep(0.02)
+
+            except Exception as e:
+                source_logger.error(f"Error sending single record: {e}")
+
+        source_logger.info(f"Completed sending data for {table_name}")
+
     except Exception as e:
         source_logger.error(f"Error fetching or sending data from {table_name}: {e}")
+        print(f"Error fetching or sending data from {table_name}: {e}")
+
     finally:
-        try:
-            if cursor:
-                cursor.close()
-        except Exception:
-            pass
-        try:
-            if conn:
-                conn.close()
-        except Exception:
-            pass
-        try:
-            if kafka_producer:
-                kafka_producer.close()
-        except Exception:
-            pass
+        if cursor:
+            cursor.close()
+        if conn:
+            conn.close()
 
 
-# Main application loop
-def main():
-    source_logger.info("Starting main producer process")
+# -----------------------------
+# ACK Receiver
+# -----------------------------
+def ack_receiver():
+    source_logger.info("ACK receiver started")
 
-    # Start periodic log flush thread
-    flush_thread = threading.Thread(target=_periodic_log_flush, daemon=True)
-    flush_thread.start()
+    while running:
+        consumer = None
+        conn = None
+        cursor = None
+
+        try:
+            # -----------------------------
+            # Kafka Consumer Setup
+            # -----------------------------
+            consumer = KafkaConsumer(
+                'ack_topic',
+                bootstrap_servers=kafka_broker,
+                value_deserializer=lambda m: json.loads(m.decode('utf-8')),
+                group_id=f"ack_group_{producer_id}",
+                auto_offset_reset='earliest',
+                enable_auto_commit=True,
+                session_timeout_ms=30000,
+                heartbeat_interval_ms=10000
+            )
+
+            source_logger.info("Connected to Kafka ACK topic")
+
+            # -----------------------------
+            # DB Connection (LOCAL DB)
+            # -----------------------------
+            # conn_str = (
+            #     "DRIVER={ODBC Driver 18 for SQL Server};"
+            #     "SERVER=localhost,1433;"
+            #     "DATABASE=PathKind_BPHT;"
+            #     "UID=sa;"
+            #     "PWD=Labsoul@2024;"
+            #     "Encrypt=no;"
+            #     "TrustServerCertificate=yes;"
+            # )
+            #
+            # conn = pyodbc.connect(conn_str, timeout=5)
+            # cursor = conn.cursor()
+
+            conn_str = (
+                f"DRIVER={{ODBC Driver 13 for SQL Server}};"
+                f"SERVER=localhost,1433;"
+                f"DATABASE=PathKind_BPHT;"
+                f"UID=sa;"
+                f"PWD=Labsoul@2024;"
+            )
+            conn = pyodbc.connect(conn_str, timeout=5)
+            cursor = conn.cursor()
+            
+            source_logger.info("Connected to LOCAL DB for ACK updates")
+
+            # -----------------------------
+            # Consume ACK Messages
+            # -----------------------------
+            for message in consumer:
+                if not running:
+                    break
+
+                try:
+                    ack = message.value
+                    source_logger.debug(f"ACK RECEIVED: {ack}")
+
+                    result_id = ack.get("ResultID")
+                    table_name = ack.get("table_name")
+                    primary_key = ack.get("primary_key", "ResultID")
+
+                    # Validation
+                    if not result_id or not table_name:
+                        source_logger.warning(f"Invalid ACK message skipped: {ack}")
+                        continue
+
+                    # Update Local DB
+                    query = f"UPDATE {table_name} SET issync = 1 WHERE {primary_key} = ?"
+                    cursor.execute(query, (result_id,))
+                    conn.commit()
+
+                    source_logger.info(f"ACK processed successfully for {table_name}:{result_id}")
+
+                except Exception as e:
+                    source_logger.error(f"Error processing ACK message: {e}")
+
+        except Exception as e:
+            source_logger.error(f"ACK receiver main loop error: {e}")
+
+        finally:
+            # -----------------------------
+            # Cleanup resources
+            # -----------------------------
+            try:
+                if cursor:
+                    cursor.close()
+                if conn:
+                    conn.close()
+                if consumer:
+                    consumer.close()
+            except Exception as cleanup_error:
+                source_logger.error(f"Error during cleanup: {cleanup_error}")
+
+        # -----------------------------
+        # Retry mechanism (avoid crash loop)
+        # -----------------------------
+        if running:
+            source_logger.info("Reconnecting ACK receiver in 5 seconds...")
+            time.sleep(5)
+
+
+# -----------------------------
+# Main application
+# -----------------------------
+if __name__ == "__main__":
+
+    # 1. Create a single producer for heartbeat
+    heartbeat_producer = KafkaProducer(
+        bootstrap_servers=kafka_broker,
+        value_serializer=lambda v: json.dumps(v, default=json_serializer).encode('utf-8')
+    )
+
+    # 2. Create a single producer for all table data
+    data_producer = KafkaProducer(
+        bootstrap_servers=kafka_broker,
+        value_serializer=lambda v: json.dumps(v, default=json_serializer).encode('utf-8')
+    )
 
     # Start heartbeat thread
-    heartbeat_thread = threading.Thread(
+    threading.Thread(
         target=send_heartbeat,
-        args=(producer_id, producer_name, location_id, kafka_broker),
+        args=(producer_id, producer_name, location_id, heartbeat_producer),
         daemon=True
-    )
-    heartbeat_thread.start()
+    ).start()
 
-    try:
-        while running:
-            for table_name, table_config in tables.items():
-                fetch_and_send_data(
-                    table_name,
-                    check_dbstatus=table_config.get("check_dbstatus", False),
-                    exclude_columns=table_config.get("exclude_columns", [])
-                )
-            wait_timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            source_logger.debug(f"Waiting for 5 seconds before the next cycle at {wait_timestamp}")
-            time.sleep(5)
-    except Exception as e:
-        source_logger.error(f"Fatal error in main loop: {e}")
-    finally:
-        source_logger.info("Shutting down producer")
-        # Allow threads to see running=False and cleanup
-        time.sleep(1)
+    # Ack thread
+    threading.Thread(
+        target=ack_receiver,
+        daemon=True
+    ).start()
 
+    # Main loop for fetching and sending data
+    while running:
+        for table_name, table_config in tables.items():
+            fetch_and_send_data(
+                table_name,
+                kafka_producer=data_producer,
+                check_dbstatus=table_config.get("check_dbstatus", False),
+                exclude_columns=table_config.get("exclude_columns", [])
+            )
 
-if __name__ == "__main__":
-    # Run the script normally via main()
-    main()
+        wait_timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        source_logger.debug(f"Waiting for 5 seconds before the next cycle at {wait_timestamp}")
+        print(f"Waiting for 5 seconds before the next cycle at {wait_timestamp}")
+        time.sleep(5)
+
+    # Flush and close producers on shutdown
+    data_producer.flush()
+    data_producer.close()
+    heartbeat_producer.flush()
+    heartbeat_producer.close()
+
+    source_logger.info("Process terminated gracefully.")
+    print("Process terminated gracefully.")
