@@ -7,11 +7,16 @@ import signal
 import os
 from dotenv import load_dotenv
 from kafka import KafkaConsumer
+from kafka import KafkaProducer
 from datetime import datetime
 from email.mime.text import MIMEText
+from kafka.structs import TopicPartition, OffsetAndMetadata
 from kafka.errors import KafkaError, NoBrokersAvailable, CommitFailedError
 from logging.handlers import TimedRotatingFileHandler
 
+
+# Global Variables
+running  = True
 
 # loading env variables
 load_dotenv()
@@ -190,7 +195,7 @@ def process_message(cursor, message):
             result = cursor.fetchone()
             if result:
                 current_db_status = result[0]
-                if record.get('DbStatus', 0) <= current_db_status:
+                if record.get('DbStatus', 0) < current_db_status:
                     logger.info(f"Skipping outdated DbStatus update for {primary_key} {record[primary_key]}")
                     return True
 
@@ -231,7 +236,14 @@ def consume_messages(consumer_group_id):
             "TrustServerCertificate=yes;"
         )
         cursor = conn.cursor()
+
         KAFKA_BOOTSTRAP_SERVERS = os.getenv("KAFKA_BOOTSTRAP_SERVERS")
+
+        ack_producer = KafkaProducer(
+            bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS,
+            value_serializer=lambda v: json.dumps(v).encode('utf-8')
+        )
+
         # Initialize Kafka consumer (excluding LogException)
         consumer = KafkaConsumer(
             *tables_columns.keys(),
@@ -247,7 +259,7 @@ def consume_messages(consumer_group_id):
         )
         logger.info("Consumer initialized. Starting message processing...")
 
-        while True:
+        while running:
             batch = consumer.poll(timeout_ms=10000, max_records=100)
             if not batch:
                 continue
@@ -255,23 +267,53 @@ def consume_messages(consumer_group_id):
             try:
                 for topic_partition, messages in batch.items():
                     for message in messages:
+
                         success = process_message(cursor, message)
+
                         if success:
-                            consumer.commit()
+                            try:
+                                record = message.value
+                                primary_key = tables_columns[message.topic][0]
+
+                                ack_message = {
+                                    "table_name": message.topic,
+                                    "primary_key": primary_key,
+                                    "ResultID": record.get(primary_key),
+                                    "location_id": record.get("LocationID"),
+                                    "status": "SUCCESS",
+                                    "timestamp": datetime.now().isoformat()
+                                }
+
+                                future = ack_producer.send("ack_topic", ack_message)
+                                future.get(timeout=10)
+
+                                # commit DB first
+                                conn.commit()
+
+                                # commit Kafka offset
+                                tp = TopicPartition(message.topic, message.partition)
+                                consumer.commit({tp: OffsetAndMetadata(message.offset + 1, None)})
+
+                                logger.info(f"ACK SENT & COMMITTED: {record.get(primary_key)}")
+
+                            except Exception as e:
+                                conn.rollback()
+                                logger.error(f"Failure: {e}")
+
                         else:
                             logger.error(f"Failed to process message: {message.value}")
 
-                conn.commit()
-                logger.info(f"Message Values{message.value}")
             except (pyodbc.OperationalError, KafkaError) as e:
-                logger.error(f"Critical error during processing: {str(e)}")
+                logger.error(f"Critical error: {str(e)}")
                 conn.rollback()
-                raise  # Trigger restart
+                raise
+
             except Exception as e:
                 logger.error(f"Unexpected error: {str(e)}")
                 conn.rollback()
                 send_email("Consumer Processing Error", f"Error occurred: {str(e)}")
                 continue
+
     finally:
         logger.info("Cleaning up resources...")
         if consumer:
@@ -280,8 +322,8 @@ def consume_messages(consumer_group_id):
             conn.close()
 
 if __name__ == "__main__":
-    #signal.signal(signal.SIGINT, handle_interrupt)
-    #signal.signal(signal.SIGTERM, handle_shutdown)
+    signal.signal(signal.SIGINT, handle_interrupt)
+    signal.signal(signal.SIGTERM, handle_shutdown)
 
     consumer_group_id = os.getenv("KAFKA_CONSUMER_GROUP")
     retry_count = 0
