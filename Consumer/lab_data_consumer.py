@@ -122,11 +122,11 @@ def send_email(subject, body):
 
 # Signal handlers for graceful shutdown
 def handle_interrupt(signum, frame):
+    global running
     logger.info("Keyboard interrupt detected. Shutting down.")
     send_email("Consumer Interrupted Alert",
                "The consumer process has been interrupted. Please check the system status.")
-    # os._exit(0)  # Force exit to break retry loop
-
+    running = False
 
 def handle_shutdown(signum, frame):
     logger.info("System is shutting down.")
@@ -162,7 +162,6 @@ def process_message(cursor, message):
 
     # --- NEW: log JSON fields and missing critical fields ---
     log_json_issues(record, table_name)
-
 
     columns = tables_columns.get(table_name)
     if not columns:
@@ -325,6 +324,7 @@ if __name__ == "__main__":
 
     signal.signal(signal.SIGINT, handle_interrupt)
     signal.signal(signal.SIGTERM, handle_shutdown)
+
 
     consumer_group_id = os.getenv("KAFKA_CONSUMER_GROUP")
     retry_count = 0
