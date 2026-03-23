@@ -322,6 +322,7 @@ def consume_messages(consumer_group_id):
             conn.close()
 
 if __name__ == "__main__":
+
     signal.signal(signal.SIGINT, handle_interrupt)
     signal.signal(signal.SIGTERM, handle_shutdown)
 
