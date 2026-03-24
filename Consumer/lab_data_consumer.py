@@ -160,7 +160,7 @@ def process_message(cursor, message):
     logger.info(f"Processing message from {message.topic}")
     table_name = message.topic
 
-    # --- NEW: log JSON fields and missing critical fields ---
+    # --- Log JSON fields and missing critical fields ---
     log_json_issues(record, table_name)
 
     columns = tables_columns.get(table_name)
@@ -168,11 +168,16 @@ def process_message(cursor, message):
         logger.error(f"Unknown table: {table_name}")
         return False
 
-    # Date parsing logic
-    date_fields = ['CreatedDate', 'Createdate', 'createdDate', 'modifiedDate',
-                   'ModifiedDate', 'CreateDate', 'ResultReceivedDate',
-                   'ResultUpdateDate', 'Timestamp', 'Samplecollectiontime',
-                   'created_at', 'updated_at']
+    # -----------------------------
+    # Date parsing
+    # -----------------------------
+    date_fields = [
+        'CreatedDate', 'Createdate', 'createdDate', 'modifiedDate',
+        'ModifiedDate', 'CreateDate', 'ResultReceivedDate',
+        'ResultUpdateDate', 'Timestamp', 'Samplecollectiontime',
+        'created_at', 'updated_at'
+    ]
+
     for key in date_fields:
         if key in record and isinstance(record[key], str):
             try:
@@ -180,44 +185,122 @@ def process_message(cursor, message):
             except (ValueError, TypeError):
                 record[key] = None
 
-    # Prepare database operation
+    # -----------------------------
+    # Prepare DB operation
+    # -----------------------------
     primary_key = columns[0]
     location_id = record.get('LocationID')
+
     if not location_id:
         logger.error(f"Missing LocationID in {table_name} record")
         return False
 
     try:
-        if 'DbStatus' in columns:
-            cursor.execute(f"SELECT DbStatus FROM {table_name} WHERE {primary_key} = ? AND LocationID = ?",
-                           (record[primary_key], location_id))
-            result = cursor.fetchone()
-            if result:
-                current_db_status = result[0]
-                if record.get('DbStatus', 0) < current_db_status:
-                    logger.info(f"Skipping outdated DbStatus update for {primary_key} {record[primary_key]}")
-                    return True
+        # -----------------------------
+        # Check existing record
+        # -----------------------------
+        cursor.execute(
+            f"""
+            SELECT DbStatus, Result, ResultReceivedDate
+            FROM {table_name}
+            WHERE {primary_key} = ? AND LocationID = ?
+            """,
+            (record[primary_key], location_id)
+        )
+        existing = cursor.fetchone()
 
-        # Build update/insert query
-        placeholders = [record.get(col, None) for col in columns]
-        if cursor.execute(f"SELECT 1 FROM {table_name} WHERE {primary_key} = ? AND LocationID = ?",
-                          (record[primary_key], location_id)).fetchone():
-            update_cols = [f"{col} = ?" for col in columns if col != primary_key]
-            query = f"UPDATE {table_name} SET {', '.join(update_cols)} WHERE {primary_key} = ? AND LocationID = ?"
-            params = placeholders[1:] + [placeholders[0], location_id]
+        incoming_status = record.get('DbStatus', 0) or 0
+
+        # -----------------------------
+        # INSERT if not exists
+        # -----------------------------
+        if not existing:
+            placeholders = [record.get(col, None) for col in columns]
+
+            query = f"""
+                INSERT INTO {table_name} ({', '.join(columns)})
+                VALUES ({', '.join(['?'] * len(columns))})
+            """
+
+            cursor.execute(query, placeholders)
+
+            logger.info(f"INSERT | ID={record[primary_key]}")
+            return True
+
+        # -----------------------------
+        # UPDATE logic (SAFE + SMART)
+        # -----------------------------
+        current_status, db_result, db_received_date = existing
+        current_status = current_status or 0
+
+        should_update = False
+
+        # 1️⃣ Newer DbStatus → update
+        if incoming_status > current_status:
+            should_update = True
+            logger.info(f"UPDATE (Newer DbStatus) | ID={record[primary_key]}")
+
+        # 2️⃣ Same DbStatus → fix NULL values
+        elif incoming_status == current_status:
+
+            if db_result is None and record.get('Result') is not None:
+                should_update = True
+                logger.info(f"FIXING NULL Result | ID={record[primary_key]}")
+
+            elif db_received_date is None and record.get('ResultReceivedDate') is not None:
+                should_update = True
+                logger.info(f"FIXING NULL ResultReceivedDate | ID={record[primary_key]}")
+
+        # 3️⃣ Older DbStatus → skip
         else:
-            query = f"INSERT INTO {table_name} ({', '.join(columns)}) VALUES ({', '.join(['?'] * len(columns))})"
-            params = placeholders
+            logger.info(
+                f"SKIPPED older record | ID={record[primary_key]} "
+                f"(incoming={incoming_status}, existing={current_status})"
+            )
+            return True
 
-        cursor.execute(query, params)
+        # -----------------------------
+        # Perform UPDATE (only if needed)
+        # -----------------------------
+        if should_update:
+
+            # Avoid unnecessary update if already same
+            if db_result == record.get('Result') and db_received_date == record.get('ResultReceivedDate'):
+                logger.info(f"SKIPPED (already up-to-date) | ID={record[primary_key]}")
+                return True
+
+            placeholders = [record.get(col, None) for col in columns]
+
+            update_cols = [f"{col} = ?" for col in columns if col != primary_key]
+
+            query = f"""
+                UPDATE {table_name}
+                SET {', '.join(update_cols)}
+                WHERE {primary_key} = ? AND LocationID = ?
+            """
+
+            params = placeholders[1:] + [placeholders[0], location_id]
+
+            cursor.execute(query, params)
+
+            logger.info(f"UPDATED | ID={record[primary_key]}")
+            return True
+
+        # -----------------------------
+        # Skip if no change needed
+        # -----------------------------
+        logger.info(f"SKIPPED (no change needed) | ID={record[primary_key]}")
         return True
+
     except pyodbc.Error as e:
-        logger.error(f"Database error: {str(e)}")
-        raise  # Re-raise to trigger transaction rollback
+        logger.error(f"Database error: {str(e)} | Record: {record}")
+        raise  # triggers rollback
+
     except Exception as e:
-        logger.error(f"Processing error: {str(e)}")
+        logger.error(f"Processing error: {str(e)} | Record: {record}")
         return False
 
+# Consume Message
 
 def consume_messages(consumer_group_id):
     consumer = None
@@ -274,6 +357,10 @@ def consume_messages(consumer_group_id):
                                 record = message.value
                                 primary_key = tables_columns[message.topic][0]
 
+                                # ✅ 1. Commit DB first (data must be saved before ACK)
+                                conn.commit()
+
+                                # ✅ 2. Prepare ACK
                                 ack_message = {
                                     "table_name": message.topic,
                                     "primary_key": primary_key,
@@ -283,22 +370,19 @@ def consume_messages(consumer_group_id):
                                     "timestamp": datetime.now().isoformat()
                                 }
 
+                                # ✅ 3. Send ACK
                                 future = ack_producer.send("ack_topic", ack_message)
                                 future.get(timeout=10)
 
-                                # commit DB first
-                                conn.commit()
-
-                                # commit Kafka offset
+                                # ✅ 4. Commit Kafka offset
                                 tp = TopicPartition(message.topic, message.partition)
                                 consumer.commit({tp: OffsetAndMetadata(message.offset + 1, None)})
 
-                                logger.info(f"ACK SENT & COMMITTED: {record.get(primary_key)}")
+                                logger.info(f"DB COMMITTED → ACK SENT → OFFSET COMMITTED: {record.get(primary_key)}")
 
                             except Exception as e:
                                 conn.rollback()
                                 logger.error(f"Failure: {e}")
-
                         else:
                             logger.error(f"Failed to process message: {message.value}")
 
