@@ -16,58 +16,130 @@ from logging.handlers import TimedRotatingFileHandler
 # loading env variables
 load_dotenv()
 
-# Configure logging
-LOG_DIR = os.path.join(os.path.dirname(__file__), "logs")
-os.makedirs(LOG_DIR, exist_ok=True)
+# # Configure logging
+# LOG_DIR = os.path.join(os.path.dirname(__file__), "logs")
+# os.makedirs(LOG_DIR, exist_ok=True)
+#
+# LOG_FORMAT = (
+#     "%(asctime)s | %(levelname)s | %(process)d | "
+#     "%(filename)s:%(lineno)d | %(message)s"
+# )
+#
+# formatter = logging.Formatter(LOG_FORMAT)
+#
+# # Main log (rotates daily)
+# file_handler = TimedRotatingFileHandler(
+#     filename=os.path.join(LOG_DIR, "consumer.log"),
+#     when="H",
+#     interval=12,
+#     backupCount=24,
+#     encoding="utf-8"
+# )
+# file_handler.setFormatter(formatter)
+# file_handler.setLevel(logging.INFO)
+#
+# # Error-only log
+# error_handler = TimedRotatingFileHandler(
+#     filename=os.path.join(LOG_DIR, "consumer_error.log"),
+#     when="H",
+#     interval=12,
+#     backupCount=24,
+#     encoding="utf-8"
+# )
+# error_handler.setFormatter(formatter)
+# error_handler.setLevel(logging.ERROR)
+#
+# # Console handler (ONLY for manual/debug runs)
+# console_handler = logging.StreamHandler()
+# console_handler.setFormatter(formatter)
+# console_handler.setLevel(logging.INFO)
+#
+# logger = logging.getLogger("KafkaConsumerService")
+# logger.setLevel(logging.INFO)
+#
+# # Prevent duplicate logs
+# logger.handlers.clear()
+#
+# logger.addHandler(file_handler)
+# logger.addHandler(error_handler)
+# logger.addHandler(console_handler)
+#
+# logger.propagate = False
 
+# -----------------------------
+# Base paths
+# -----------------------------
+if getattr(sys, "frozen", False):
+    BASE_DIR = os.path.dirname(sys.executable)
+else:
+    BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+LOG_DIR = os.path.join(BASE_DIR, "logs")
+ARCHIVE_DIR = os.path.join(LOG_DIR, "archive")
+
+os.makedirs(LOG_DIR, exist_ok=True)
+os.makedirs(ARCHIVE_DIR, exist_ok=True)
+
+# -----------------------------
+# Log format
+# -----------------------------
 LOG_FORMAT = (
-    "%(asctime)s | %(levelname)s | %(process)d | "
+    "%(asctime)s | %(levelname)s | %(process)d | %(threadName)s | "
     "%(filename)s:%(lineno)d | %(message)s"
 )
-
 formatter = logging.Formatter(LOG_FORMAT)
 
-# Main log (rotates daily)
+# -----------------------------
+# Main log - rotate hourly
+# keep 24 files in main folder
+# -----------------------------
 file_handler = TimedRotatingFileHandler(
     filename=os.path.join(LOG_DIR, "consumer.log"),
     when="H",
-    interval=12,
+    interval=1,
     backupCount=24,
     encoding="utf-8"
 )
+file_handler.suffix = "%Y-%m-%d_%H.log"
 file_handler.setFormatter(formatter)
 file_handler.setLevel(logging.INFO)
 
-# Error-only log
+# -----------------------------
+# Error-only log - rotate hourly
+# keep 24 files in main folder
+# -----------------------------
 error_handler = TimedRotatingFileHandler(
     filename=os.path.join(LOG_DIR, "consumer_error.log"),
     when="H",
-    interval=12,
+    interval=1,
     backupCount=24,
     encoding="utf-8"
 )
+error_handler.suffix = "%Y-%m-%d_%H.log"
 error_handler.setFormatter(formatter)
 error_handler.setLevel(logging.ERROR)
 
-# Console handler (ONLY for manual/debug runs)
-console_handler = logging.StreamHandler()
-console_handler.setFormatter(formatter)
-console_handler.setLevel(logging.INFO)
+# -----------------------------
+# Console log only if enabled
+# -----------------------------
+ENABLE_CONSOLE_LOG = os.getenv("ENABLE_CONSOLE_LOG", "false").lower() == "true"
 
 logger = logging.getLogger("KafkaConsumerService")
 logger.setLevel(logging.INFO)
-
-# Prevent duplicate logs
 logger.handlers.clear()
-
 logger.addHandler(file_handler)
 logger.addHandler(error_handler)
-logger.addHandler(console_handler)
+
+if ENABLE_CONSOLE_LOG:
+    console_handler = logging.StreamHandler()
+    console_handler.setFormatter(formatter)
+    console_handler.setLevel(logging.INFO)
+    logger.addHandler(console_handler)
 
 logger.propagate = False
 
 
-
+# smtp email config
 EMAIL_SENDER = os.getenv("EMAIL_SENDER")
 EMAIL_PASSWORD = os.getenv("EMAIL_PASSWORD")
 EMAIL_RECEIVER =os.getenv("EMAIL_RECEIVER")
@@ -129,24 +201,26 @@ def handle_shutdown(signum, frame):
     #os._exit(0)  # Force exit to break retry loop
 
 # json management
-def log_json_issues(record, table_name):
-    """
-    Log important JSON fields and any missing critical fields.
-    """
-    # Log DbStatus and Result
-    db_status = record.get('DbStatus')
-    result = record.get('Result')
-    result_id = record.get('ResultID')
-    logger.info(f"JSON Fields - DbStatus: {db_status},ResultID: {result_id}, Result: {result}, Table: {table_name}")
+# def log_json_issues(record, table_name):
+#     """
+#     Log important JSON fields and any missing critical fields.
+#     """
+#     # Log DbStatus and Result
+#     db_status = record.get('DbStatus')
+#     result = record.get('Result')
+#     result_id = record.get('ResultID')
+#     logger.info(f"JSON Fields - DbStatus: {db_status},ResultID: {result_id}, Result: {result}, Table: {table_name}")
+#
+#     # Check for missing critical fields
+#     missing_fields = []
+#     for field in ['Result', 'ResultReceivedDate', 'CreatedDate']:
+#         if field not in record or record.get(field) in [None, '', 'null']:
+#             missing_fields.append(field)
+#
+#     if missing_fields:
+#         logger.warning(f"Missing fields in record {record.get('ResultID', record.get('OrderID', 'N/A'))}: {missing_fields}")
 
-    # Check for missing critical fields
-    missing_fields = []
-    for field in ['Result', 'ResultReceivedDate', 'CreatedDate']:
-        if field not in record or record.get(field) in [None, '', 'null']:
-            missing_fields.append(field)
 
-    if missing_fields:
-        logger.warning(f"Missing fields in record {record.get('ResultID', record.get('OrderID', 'N/A'))}: {missing_fields}")
 
 
 # Process a single Kafka message
@@ -156,7 +230,7 @@ def process_message(cursor, message):
     table_name = message.topic
 
     # --- NEW: log JSON fields and missing critical fields ---
-    log_json_issues(record, table_name)
+    # log_json_issues(record, table_name)
 
 
     columns = tables_columns.get(table_name)
@@ -239,7 +313,7 @@ def consume_messages(consumer_group_id):
             value_deserializer=lambda x: json.loads(x.decode('utf-8')),
             # api_version=(2,7),
             enable_auto_commit=False,
-            auto_offset_reset='earliest',
+            auto_offset_reset='latest',
             group_id=consumer_group_id,
             # max_poll_interval_ms=600000,
             session_timeout_ms=30000,
@@ -255,14 +329,15 @@ def consume_messages(consumer_group_id):
             try:
                 for topic_partition, messages in batch.items():
                     for message in messages:
+                        logger.info("Received Message:\n %s",json.dumps(message.value,indent=4,default=str))
                         success = process_message(cursor, message)
                         if success:
                             consumer.commit()
+                            logger.info(f"Message Values to commmitt {message.value}")
                         else:
                             logger.error(f"Failed to process message: {message.value}")
 
                 conn.commit()
-                logger.info(f"Message Values{message.value}")
             except (pyodbc.OperationalError, KafkaError) as e:
                 logger.error(f"Critical error during processing: {str(e)}")
                 conn.rollback()
@@ -284,6 +359,7 @@ if __name__ == "__main__":
     #signal.signal(signal.SIGTERM, handle_shutdown)
 
     consumer_group_id = os.getenv("KAFKA_CONSUMER_GROUP")
+    logging.info(consumer_group_id)
     retry_count = 0
     max_retry_delay = 300  # 5 minutes
 
