@@ -3,19 +3,13 @@ import pyodbc
 import logging
 import os
 from kafka import KafkaProducer
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
 import time
 import sys
 import signal
 import threading
 from logging.handlers import TimedRotatingFileHandler
-from datetime import datetime, date
 from decimal import Decimal
-# import win32serviceutil
-# import win32service
-# import win32event
-# import servicemanager
-
 
 # -----------------------------
 # Global variable to control running state
@@ -57,7 +51,7 @@ handler = TimedRotatingFileHandler(
     log_file_path,
     when="H",
     interval=1,
-    backupCount=0,   # keep all rotated logs
+    backupCount=0,
     encoding="utf-8"
 )
 handler.suffix = "%Y%m%d_%H.log"
@@ -66,7 +60,9 @@ source_logger = logging.getLogger('source_db_logger')
 source_logger.setLevel(logging.DEBUG)
 formatter = logging.Formatter('%(asctime)s %(levelname)s %(message)s')
 handler.setFormatter(formatter)
-source_logger.addHandler(handler)
+
+if not source_logger.handlers:
+    source_logger.addHandler(handler)
 
 # -----------------------------
 # Load configuration
@@ -93,9 +89,8 @@ except KeyError as e:
     sys.exit(1)
 
 # -----------------------------
-# Json Serialization
+# JSON Serialization
 # -----------------------------
-
 def json_serializer(obj):
     if isinstance(obj, (datetime, date)):
         return obj.isoformat()
@@ -110,19 +105,23 @@ def send_heartbeat(producer_id, producer_name, location_id, kafka_producer):
     heartbeat_topic = 'producer_heartbeat'
 
     while running:
-        heartbeat_message = {
-            'producer_id': producer_id,
-            'producer_name': producer_name,
-            'location_id': location_id,
-            'timestamp': datetime.now().isoformat()
-        }
+        try:
+            heartbeat_message = {
+                'producer_id': producer_id,
+                'producer_name': producer_name,
+                'location_id': location_id,
+                'timestamp': datetime.now().isoformat()
+            }
 
-        kafka_producer.send(heartbeat_topic, heartbeat_message)
-        source_logger.debug(f"Sent heartbeat: {heartbeat_message}")
-        print(f"Sent heartbeat: {heartbeat_message}")
+            kafka_producer.send(heartbeat_topic, heartbeat_message)
+            source_logger.debug(f"Sent heartbeat: {heartbeat_message}")
+            print(f"Sent heartbeat: {heartbeat_message}")
 
-        time.sleep(10)  # heartbeat every 10 seconds
+        except Exception as e:
+            source_logger.error(f"Heartbeat send failed: {e}")
+            print(f"Heartbeat send failed: {e}")
 
+        time.sleep(10)
 
 # -----------------------------
 # Data fetch and send
@@ -153,53 +152,119 @@ def fetch_and_send_data(table_name, kafka_producer, check_dbstatus=False, exclud
         three_days_ago = (datetime.now() - timedelta(days=3)).strftime('%Y-%m-%d')
 
         if table_name == "dbo.Patient_Details":
-            query = f"SELECT * FROM {table_name} WHERE issync = 0 AND CreateDate >= '{three_days_ago}'"
-        elif table_name in ["dbo.Orders", "dbo.Test_Parameters"]:
-            query = f"SELECT * FROM {table_name} WHERE issync = 0 AND CreatedDate >= '{three_days_ago}'"
-        elif table_name == "dbo.UtilityException":
-            query = f"SELECT * FROM {table_name} WHERE issync = 0 AND Timestamp >= '{three_days_ago}'"
-        else:
-            query = f"SELECT * FROM {table_name} WHERE issync = 0"
+            query = f"""
+                SELECT * FROM {table_name}
+                WHERE IsSync = 0
+                  AND CreateDate >= '{three_days_ago}'
+            """
 
-        if check_dbstatus:
+        elif table_name == "dbo.Orders":
+            query = f"""
+                SELECT * FROM {table_name}
+                WHERE IsSync = 0
+                  AND CreatedDate >= '{three_days_ago}'
+            """
+
+        elif table_name == "dbo.Test_Parameters":
+            query = f"""
+                SELECT * FROM {table_name}
+                WHERE IsSync = 0
+                  AND DbStatus IN (1, 5)
+            """
+
+        elif table_name == "dbo.UtilityException":
+            query = f"""
+                SELECT * FROM {table_name}
+                WHERE IsSync = 0
+                  AND Timestamp >= '{three_days_ago}'
+            """
+
+        else:
+            query = f"SELECT * FROM {table_name} WHERE IsSync = 0"
+
+        # Keep this only for other tables, not Test_Parameters
+        if check_dbstatus and table_name != "dbo.Test_Parameters":
             query += " AND DbStatus BETWEEN 1 AND 5"
+
+        source_logger.debug(f"Executing query for {table_name}: {query}")
+        print(f"Executing query for {table_name}: {query}")
 
         cursor.execute(query)
         rows = cursor.fetchall()
         columns = [desc[0] for desc in cursor.description]
 
         for row in rows:
-            record = {
-                col: val
-                for col, val in zip(columns, row)
-                if col not in exclude_columns
-            }
+            try:
+                record = {
+                    col: val
+                    for col, val in zip(columns, row)
+                    if col not in exclude_columns
+                }
 
-            # Debug: log actual JSON being sent
-            json_data = json.dumps(record, default=json_serializer)
-            source_logger.info(f"ACTUAL JSON SENT: {json_data}")
-            print(f"ACTUAL JSON SENT: {json_data}")
+                primary_key_column = 'ResultID' if 'ResultID' in columns else columns[0]
+                primary_key_value = record[primary_key_column]
 
-            # future = kafka_producer.send(table_name, record)
-            # future.get(timeout=10)
+                # remove internal columns before sending to Kafka
+                record_to_send = dict(record)
+                record_to_send.pop("IsSync", None)
+                record_to_send.pop("IsJsonCreated", None)
 
-            future = kafka_producer.send(table_name, record)
-            future.get(timeout=10)  # wait for ACK
+                # 1. Create JSON first
+                json_data = json.dumps(record_to_send, default=json_serializer)
+                source_logger.info(f"ACTUAL JSON CREATED: {json_data}")
+                print(f"ACTUAL JSON CREATED: {json_data}")
 
-            source_logger.debug(f"Sent record to Kafka: {record}")
-            print(f"Sent record to Kafka: {record}")
+                # 2. Mark IsJsonCreated = 1 after JSON creation
+                update_json_query = f"""
+                    UPDATE {table_name}
+                    SET IsJsonCreated = 1
+                    WHERE {primary_key_column} = ?
+                      AND IsSync = 0
+                """
+                cursor.execute(update_json_query, (primary_key_value,))
+                conn.commit()
 
-            primary_key_column = 'ResultID' if 'ResultID' in columns else columns[0]
-            update_query = f"UPDATE {table_name} SET issync = 1 WHERE {primary_key_column} = ?"
+                source_logger.debug(
+                    f"Marked IsJsonCreated=1 for {primary_key_column}: {primary_key_value}"
+                )
+                print(
+                    f"Marked IsJsonCreated=1 for {primary_key_column}: {primary_key_value}"
+                )
 
-            cursor.execute(update_query, (record[primary_key_column],))
-            conn.commit()
+                # 3. Send to Kafka
+                future = kafka_producer.send(table_name, record_to_send)
 
-            source_logger.debug(f"Updated issync for record with {primary_key_column}: {record[primary_key_column]}")
-            print(f"Updated issync for record with {primary_key_column}: {record[primary_key_column]}")
+                # 4. Wait for broker ACK
+                future.get(timeout=10)
 
-        source_logger.info(f"Successfully fetched and sent data from {table_name}")
-        print(f"Successfully fetched and sent data from {table_name}")
+                source_logger.debug(f"Broker ACK received for record: {primary_key_value}")
+                print(f"Broker ACK received for record: {primary_key_value}")
+
+                # 5. Mark IsSync = 1 only after broker ACK
+                update_sync_query = f"""
+                    UPDATE {table_name}
+                    SET IsSync = 1
+                    WHERE {primary_key_column} = ?
+                      AND IsJsonCreated = 1
+                """
+                cursor.execute(update_sync_query, (primary_key_value,))
+                conn.commit()
+
+                source_logger.debug(
+                    f"Marked IsSync=1 after broker ACK for {primary_key_column}: {primary_key_value}"
+                )
+                print(
+                    f"Marked IsSync=1 after broker ACK for {primary_key_column}: {primary_key_value}"
+                )
+
+            except Exception as row_error:
+                source_logger.error(
+                    f"Row processing failed for table {table_name}: {row_error}"
+                )
+                print(f"Row processing failed for table {table_name}: {row_error}")
+
+        source_logger.info(f"Successfully fetched and processed data from {table_name}")
+        print(f"Successfully fetched and processed data from {table_name}")
 
     except Exception as e:
         source_logger.error(f"Error fetching or sending data from {table_name}: {e}")
@@ -210,7 +275,6 @@ def fetch_and_send_data(table_name, kafka_producer, check_dbstatus=False, exclud
             cursor.close()
         if conn:
             conn.close()
-
 
 def delete_old_logs():
     source_logger.info("Daily log deletion thread started")
@@ -224,11 +288,9 @@ def delete_old_logs():
             for filename in os.listdir(logs_dir):
                 file_path = os.path.join(logs_dir, filename)
 
-                # Skip non-files
                 if not os.path.isfile(file_path):
                     continue
 
-                # Do NOT delete active log file
                 if filename == "producer.log":
                     continue
 
@@ -239,52 +301,43 @@ def delete_old_logs():
                         os.remove(file_path)
                         source_logger.info(f"Deleted old log file: {filename}")
                     except Exception as e:
-                        source_logger.error(
-                            f"Failed to delete log {filename}: {e}"
-                        )
+                        source_logger.error(f"Failed to delete log {filename}: {e}")
 
         except Exception as e:
             source_logger.error(f"Daily log cleanup failed: {e}")
 
-        # Sleep for 24 hours (safe shutdown)
         for _ in range(LOG_DELETE_INTERVAL_SECONDS):
             if not running:
                 source_logger.info("Log deletion thread stopping")
                 return
             time.sleep(1)
 
-
 # -----------------------------
 # Main application
 # -----------------------------
 if __name__ == "__main__":
 
-    # 1. Create a single producer for heartbeat
     heartbeat_producer = KafkaProducer(
         bootstrap_servers=kafka_broker,
         value_serializer=lambda v: json.dumps(v, default=json_serializer).encode('utf-8')
     )
 
-    # 2. Create a single producer for all table data
     data_producer = KafkaProducer(
         bootstrap_servers=kafka_broker,
         value_serializer=lambda v: json.dumps(v, default=json_serializer).encode('utf-8')
     )
 
-    # Start heartbeat thread
     threading.Thread(
         target=send_heartbeat,
         args=(producer_id, producer_name, location_id, heartbeat_producer),
         daemon=True
     ).start()
 
-    # Start log deletion thread
     threading.Thread(
         target=delete_old_logs,
         daemon=True
     ).start()
 
-    # Main loop for fetching and sending data
     while running:
         for table_name, table_config in tables.items():
             fetch_and_send_data(
@@ -299,7 +352,6 @@ if __name__ == "__main__":
         print(f"Waiting for 5 seconds before the next cycle at {wait_timestamp}")
         time.sleep(5)
 
-    # Flush and close producers on shutdown
     data_producer.flush()
     data_producer.close()
     heartbeat_producer.flush()
@@ -307,6 +359,3 @@ if __name__ == "__main__":
 
     source_logger.info("Process terminated gracefully.")
     print("Process terminated gracefully.")
-
-
-
