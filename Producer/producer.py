@@ -71,6 +71,7 @@ source_logger.addHandler(handler)
 # -----------------------------
 # Load configuration
 # -----------------------------
+
 config_file_path = os.path.join(exe_dir, 'config.json')
 try:
     with open(config_file_path, 'r') as config_file:
@@ -97,6 +98,7 @@ except KeyError as e:
 # -----------------------------
 
 def json_serializer(obj):
+
     if isinstance(obj, (datetime, date)):
         return obj.isoformat()
     if isinstance(obj, Decimal):
@@ -107,6 +109,7 @@ def json_serializer(obj):
 # Heartbeat producer
 # -----------------------------
 def send_heartbeat(producer_id, producer_name, location_id, kafka_producer):
+
     heartbeat_topic = 'producer_heartbeat'
 
     while running:
@@ -127,7 +130,9 @@ def send_heartbeat(producer_id, producer_name, location_id, kafka_producer):
 # -----------------------------
 # Data fetch and send
 # -----------------------------
+
 def fetch_and_send_data(table_name, kafka_producer, check_dbstatus=False, exclude_columns=None):
+
     exclude_columns = exclude_columns or []
 
     source_logger.debug(f"Connecting to source database for table {table_name}")
@@ -154,15 +159,19 @@ def fetch_and_send_data(table_name, kafka_producer, check_dbstatus=False, exclud
 
         if table_name == "dbo.Patient_Details":
             query = f"SELECT * FROM {table_name} WHERE issync = 0 AND CreateDate >= '{three_days_ago}'"
+
         elif table_name in ["dbo.Orders", "dbo.Test_Parameters"]:
             query = f"SELECT * FROM {table_name} WHERE issync = 0 AND CreatedDate >= '{three_days_ago}'"
+
+            # apply DbStatus filter ONLY for Test_Parameters
+            if check_dbstatus and table_name == "dbo.Test_Parameters":
+                query += " AND DbStatus IN (1, 5)"
+
         elif table_name == "dbo.UtilityException":
             query = f"SELECT * FROM {table_name} WHERE issync = 0 AND Timestamp >= '{three_days_ago}'"
+
         else:
             query = f"SELECT * FROM {table_name} WHERE issync = 0"
-
-        if check_dbstatus:
-            query += " AND DbStatus BETWEEN 1 AND 5"
 
         cursor.execute(query)
         rows = cursor.fetchall()
@@ -175,16 +184,12 @@ def fetch_and_send_data(table_name, kafka_producer, check_dbstatus=False, exclud
                 if col not in exclude_columns
             }
 
-            # Debug: log actual JSON being sent
             json_data = json.dumps(record, default=json_serializer)
             source_logger.info(f"ACTUAL JSON SENT: {json_data}")
             print(f"ACTUAL JSON SENT: {json_data}")
 
-            # future = kafka_producer.send(table_name, record)
-            # future.get(timeout=10)
-
             future = kafka_producer.send(table_name, record)
-            future.get(timeout=10)  # wait for ACK
+            future.get(timeout=10)
 
             source_logger.debug(f"Sent record to Kafka: {record}")
             print(f"Sent record to Kafka: {record}")
@@ -307,6 +312,3 @@ if __name__ == "__main__":
 
     source_logger.info("Process terminated gracefully.")
     print("Process terminated gracefully.")
-
-
-
