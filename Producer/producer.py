@@ -158,20 +158,39 @@ def fetch_and_send_data(table_name, kafka_producer, check_dbstatus=False, exclud
         three_days_ago = (datetime.now() - timedelta(days=3)).strftime('%Y-%m-%d')
 
         if table_name == "dbo.Patient_Details":
-            query = f"SELECT * FROM {table_name} WHERE issync = 0 AND CreateDate >= '{three_days_ago}'"
+            query = f"""
+                SELECT TOP 500 * FROM {table_name}
+                WHERE issync = 0 AND CreateDate >= '{three_days_ago}'
+                ORDER BY CreateDate
+            """
 
         elif table_name in ["dbo.Orders", "dbo.Test_Parameters"]:
-            query = f"SELECT * FROM {table_name} WHERE issync = 0 AND CreatedDate >= '{three_days_ago}'"
+            query = f"""
+                SELECT TOP 500 * FROM {table_name}
+                WHERE issync = 0 AND CreatedDate >= '{three_days_ago}'
+            """
 
             # apply DbStatus filter ONLY for Test_Parameters
             if check_dbstatus and table_name == "dbo.Test_Parameters":
                 query += " AND DbStatus IN (1, 5)"
 
+            query += " ORDER BY CreatedDate"
+
         elif table_name == "dbo.UtilityException":
-            query = f"SELECT * FROM {table_name} WHERE issync = 0 AND Timestamp >= '{three_days_ago}'"
+            query = f"""
+                SELECT TOP 500 * FROM {table_name}
+                WHERE issync = 0 AND Timestamp >= '{three_days_ago}'
+                ORDER BY Timestamp
+            """
 
         else:
-            query = f"SELECT * FROM {table_name} WHERE issync = 0"
+            query = f"""
+                SELECT TOP 500 * FROM {table_name}
+                WHERE issync = 0
+            """
+
+        source_logger.info(f"FINAL QUERY: {query}")
+        print(f"FINAL QUERY: {query}")
 
         cursor.execute(query)
         rows = cursor.fetchall()
@@ -215,7 +234,6 @@ def fetch_and_send_data(table_name, kafka_producer, check_dbstatus=False, exclud
             cursor.close()
         if conn:
             conn.close()
-
 
 def delete_old_logs():
     source_logger.info("Daily log deletion thread started")
