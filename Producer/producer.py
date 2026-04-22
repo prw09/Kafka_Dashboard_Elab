@@ -164,17 +164,21 @@ def fetch_and_send_data(table_name, kafka_producer, check_dbstatus=False, exclud
                 ORDER BY CreateDate
             """
 
-        elif table_name in ["dbo.Orders", "dbo.Test_Parameters"]:
+        elif table_name == "dbo.Orders":
             query = f"""
                 SELECT TOP 500 * FROM {table_name}
                 WHERE issync = 0 AND CreatedDate >= '{three_days_ago}'
+                ORDER BY CreatedDate
             """
 
-            # apply DbStatus filter ONLY for Test_Parameters
-            if check_dbstatus and table_name == "dbo.Test_Parameters":
-                query += " AND DbStatus IN (1, 5)"
-
-            query += " ORDER BY CreatedDate"
+        elif table_name == "dbo.Test_Parameters":
+            query = f"""
+                SELECT TOP 500 * FROM {table_name}
+                WHERE issync = 0
+                  AND CreatedDate >= '{three_days_ago}'
+                  AND DbStatus IN (1, 5)
+                ORDER BY CreatedDate
+            """
 
         elif table_name == "dbo.UtilityException":
             query = f"""
@@ -234,6 +238,7 @@ def fetch_and_send_data(table_name, kafka_producer, check_dbstatus=False, exclud
             cursor.close()
         if conn:
             conn.close()
+
 
 def delete_old_logs():
     source_logger.info("Daily log deletion thread started")
