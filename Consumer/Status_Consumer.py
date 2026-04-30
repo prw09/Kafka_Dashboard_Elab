@@ -5,32 +5,26 @@ import time
 import smtplib
 import signal
 import os
-from kafka import KafkaConsumer
-from Kafka import KafkaProducer
+from kafka import KafkaConsumer, KafkaProducer
 from datetime import datetime, timedelta
 from email.mime.text import MIMEText
 from kafka.errors import KafkaError, NoBrokersAvailable, CommitFailedError
-from flask import Flask, jsonify
+from flask import Flask
 from flask_cors import CORS
 import threading
 from dotenv import load_dotenv
-from packaging.tags import AppleVersion
 
 
 # loading env variables
 load_dotenv()
 
+
 # global variables
 KAFKA_BOOTSTRAP = os.getenv("KAFKA_BOOTSTRAP_SERVERS")
-PRODUCER_TIMEOUT_SECONDS=os.getenv("PRODUCER_TIMEOUT_SECONDS")
-
+PRODUCER_TIMEOUT_SECONDS = os.getenv("PRODUCER_TIMEOUT_SECONDS")
 
 # Initialize logging
 from logging.handlers import TimedRotatingFileHandler
-
-
-# Global variables
-
 
 LOG_DIR = os.path.join(os.path.dirname(__file__), "logs")
 os.makedirs(LOG_DIR, exist_ok=True)
@@ -91,18 +85,25 @@ DB_NAME = os.getenv("DB_NAME")
 DB_USER = os.getenv("DB_USER")
 DB_PASSWORD = os.getenv("DB_PASSWORD")
 
-# Timeout for considering a producer dead (in seconds)
-timeout = 60  # 1 minute timeout
+timeout = 60
 
 # Initialize Flask app
 app = Flask(__name__)
 CORS(app)
 
+
 tables_columns = {
-    "dbo.LogException": ['ID', 'MachineFID', 'MessageString', 'Timestamp', 'LogType', 'ErrorCode', 'ModifiedDate',
-                         'LocationID', 'IsSync'],
-    "dbo.Machine": ['ID', 'MachineName', 'LocationID', 'CategoryID', 'ConnectionMode', 'QCStatus', 'CreateDate',
-                    'ModifiedDate', 'IsSync', 'InstrumentId', 'IsDeleted'],
+    "dbo.LogException": [
+        'ID', 'MachineFID', 'MessageString', 'Timestamp', 'LogType',
+        'ErrorCode', 'ModifiedDate', 'LocationID', 'IsSync'
+    ],
+
+    "dbo.Machine": [
+        'ID', 'MachineName', 'LocationID', 'CategoryID', 'ConnectionMode',
+        'QCStatus', 'CreateDate', 'ModifiedDate', 'IsSync',
+        'InstrumentId', 'IsDeleted'
+    ],
+
     "dbo.QCIntegrationTable": [
         'QCID', 'SenderName', 'DateTimeofResult', 'LotID', 'ControlLevel',
         'QCBottleNo', 'ActionCode', 'SampleType', 'Parameter', 'Dilution',
@@ -110,16 +111,39 @@ tables_columns = {
         'OperatorID', 'Comment1', 'Comment2', 'MachineFid', 'InstrumentID',
         'LocationId', 'Dbstatus', 'CreatedDate', 'Modifieddate', 'IsSync'
     ],
-    "dbo.AppVersionLog": ['Id','InstallationVersionNumber','InstallationSystemName','UserName','InstrumentName',
-                          'LocationName','CenterId','LogDate','BuildVersion','BuildDate','IsSync'],
-    "dbo.MachineMapping": ['Id','MachineFId','ConfigMachineDataFID','ParameterFId','pFrom','pTo','TestParamFID','Expression','DecimalPlaces','CheckField',
-                           'test','postfix','SampleType','IsDeleted','CreateDate','ModifiedDate','TestFID','LocationID','IsSync']
+
+    "dbo.AppVersionLog": [
+        'Id', 'InstallationVersionNumber', 'InstallationSystemName',
+        'UserName', 'InstrumentName', 'LocationName', 'CenterId',
+        'LogDate', 'BuildVersion', 'BuildDate', 'IsSync'
+    ],
+
+    "dbo.MachineMapping": [
+        'Id', 'MachineFId', 'ConfigMachineDataFID', 'ParameterFId',
+        'pFrom', 'pTo', 'TestParamFID', 'Expression', 'DecimalPlaces',
+        'CheckField', 'test', 'postfix', 'SampleType', 'IsDeleted',
+        'CreateDate', 'ModifiedDate', 'TestFID', 'LocationID', 'IsSync'
+    ],
+
+    # NEW TABLE ADDED FOR SYNC
+    "dbo.MachineParameters": [
+        'Id',
+        'Parameter',
+        'isDeleted',
+        'ParmeterHeader',
+        'MachineFID',
+        'ConfigMachineDataFID',
+        'ValueField',
+        'TestField',
+        'LISParamName',
+        'CreateDate',
+        'ModifiedDate',
+        'LocationID'
+    ]
 }
 
 
-# Function to get database connection
 def get_db_connection():
-
     conn = pyodbc.connect(
         f"DRIVER={DB_DRIVER13};"
         f"SERVER={DB_SERVER};"
@@ -130,115 +154,138 @@ def get_db_connection():
     return conn
 
 
-# Function to update producer status in the database
 def update_producer_status(producer_id, producer_name, location_id, last_heartbeat, status):
     conn = get_db_connection()
     cursor = conn.cursor()
+
     try:
         cursor.execute("""
             MERGE INTO ProducerStatus AS target
-            USING (VALUES (?, ?, ?, ?, ?)) AS source (producer_id, producer_name, location_id, last_heartbeat, status)
+            USING (VALUES (?, ?, ?, ?, ?)) AS source 
+            (producer_id, producer_name, location_id, last_heartbeat, status)
             ON target.producer_id = source.producer_id
+
             WHEN MATCHED THEN
-                UPDATE SET target.producer_name = source.producer_name,
-                           target.location_id = source.location_id,
-                           target.last_heartbeat = source.last_heartbeat,
-                           target.status = source.status
+                UPDATE SET 
+                    target.producer_name = source.producer_name,
+                    target.location_id = source.location_id,
+                    target.last_heartbeat = source.last_heartbeat,
+                    target.status = source.status
+
             WHEN NOT MATCHED THEN
-                INSERT (producer_id, producer_name, location_id, last_heartbeat, status)
-                VALUES (source.producer_id, source.producer_name, source.location_id, source.last_heartbeat, source.status);
+                INSERT (
+                    producer_id, producer_name, location_id, last_heartbeat, status
+                )
+                VALUES (
+                    source.producer_id, source.producer_name,
+                    source.location_id, source.last_heartbeat, source.status
+                );
         """, producer_id, producer_name, location_id, last_heartbeat, status)
+
         conn.commit()
+
     except pyodbc.Error as e:
         logger.error(f"Database error: {str(e)}")
+
     finally:
         cursor.close()
         conn.close()
 
 
-# Function to mark producers as dead if they haven't sent a heartbeat within the timeout period
 def mark_producers_as_dead():
     while True:
         conn = get_db_connection()
         cursor = conn.cursor()
+
         try:
             cursor.execute("""
                 UPDATE ProducerStatus
                 SET status = 0
                 WHERE last_heartbeat < ?
             """, datetime.now() - timedelta(seconds=timeout))
-            print()
+
             conn.commit()
+
         except pyodbc.Error as e:
             logger.error(f"Database error: {str(e)}")
+
         finally:
             cursor.close()
             conn.close()
-        time.sleep(timeout)  # Run this cleanup every timeout seconds
+
+        time.sleep(timeout)
 
 
-# Function to monitor producer heartbeat
 def monitor_producer_heartbeat():
     consumer = KafkaConsumer(
         'producer_heartbeat',
         bootstrap_servers=KAFKA_BOOTSTRAP,
         value_deserializer=lambda x: json.loads(x.decode('utf-8')),
-        #api_version=(2, 7),
         enable_auto_commit=False,
         auto_offset_reset='latest',
         group_id='heartbeat_monitor',
-        #max_poll_interval_ms=600000,
         session_timeout_ms=30000,
         heartbeat_interval_ms=10000
     )
 
-
     for message in consumer:
         heartbeat_message = message.value
+
         producer_id = heartbeat_message['producer_id']
         producer_name = heartbeat_message['producer_name']
         location_id = heartbeat_message['location_id']
-        last_heartbeat = datetime.fromisoformat(heartbeat_message['timestamp'])
         timestamp_str = heartbeat_message['timestamp']
 
-        status = 1  # Running
-
-        print(f"Received heartbeat message: {heartbeat_message}")
-
         last_heartbeat = datetime.fromisoformat(timestamp_str)
-        update_producer_status(producer_id, producer_name, location_id, last_heartbeat, status)
+        status = 1
 
-# Function to send email
+        logger.info(f"Received heartbeat message: {heartbeat_message}")
+
+        update_producer_status(
+            producer_id,
+            producer_name,
+            location_id,
+            last_heartbeat,
+            status
+        )
+
+
 def send_email(subject, body):
     msg = MIMEText(body)
     msg['Subject'] = subject
     msg['From'] = EMAIL_SENDER
     msg['To'] = EMAIL_RECEIVER
+
     try:
-        with smtplib.SMTP(SMTP_SERVER, SMTP_PORT) as server:
+        with smtplib.SMTP(SMTP_SERVER, int(SMTP_PORT)) as server:
             server.starttls()
             server.login(EMAIL_SENDER, EMAIL_PASSWORD)
             server.send_message(msg)
-            logger.info(f"Email sent: {subject}")
+
+        logger.info(f"Email sent: {subject}")
+
     except Exception as e:
         logger.error(f"Failed to send email: {e}")
 
 
-# Signal handling
 def handle_interrupt(signum, frame):
-    logger.info("Keyboard interrupt detected. Shutting down LogException/Machine consumer.")
-    send_email("Consumer2 Interrupted Alert",
-               "The consumer2.py process (LogException/Machine) has been interrupted. Please check the system status.")
+    logger.info("Keyboard interrupt detected. Shutting down consumer2.")
+    send_email(
+        "Consumer2 Interrupted Alert",
+        "The consumer2.py process has been interrupted. Please check the system status."
+    )
     os._exit(0)
 
 
 def handle_shutdown(signum, frame):
     logger.info("System is shutting down.")
-    send_email("Consumer2 Shutdown", "The system is shutting down. Check LogException/Machine consumer status.")
+    send_email(
+        "Consumer2 Shutdown",
+        "The system is shutting down. Check consumer2 status."
+    )
     os._exit(0)
 
 
-# Consume Kafka messages
 def consume_messages():
     conn = pyodbc.connect(
         f"DRIVER={DB_DRIVER13};"
@@ -251,43 +298,38 @@ def consume_messages():
     cursor = conn.cursor()
 
     consumer = KafkaConsumer(
-        "dbo.LogException", "dbo.Machine","dbo.AppVersionLog","dbo.MachineMapping",
+        "dbo.LogException",
+        "dbo.Machine",
+        "dbo.AppVersionLog",
+        "dbo.MachineMapping",
+        "dbo.MachineParameters",
         bootstrap_servers=KAFKA_BOOTSTRAP,
         value_deserializer=lambda x: json.loads(x.decode('utf-8')),
-        #api_version=(2, 7),
         enable_auto_commit=False,
         auto_offset_reset='earliest',
         group_id='logexception_machine_sync',
-        #max_poll_interval_ms=600000,
         session_timeout_ms=30000,
         heartbeat_interval_ms=10000
     )
 
-    logger.info("LogException/Machine Consumer initialized. Starting message processing...")
-
-    # Initialize Kafka producer for acks
-    ack_producer = KafkaProducer(
-        bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS,
-        value_serializer=lambda v: json.dumps(v).encode('utf-8')
-    )
-    ACK_TOPIC = os.getenv("KAFKA_ACK_TOPIC", "ack-topic")
+    logger.info("Consumer2 initialized. Starting message processing...")
 
     while True:
         batch = consumer.poll(timeout_ms=5000, max_records=200)
+
         if not batch:
             continue
 
         messages = [msg for tp, msgs in batch.items() for msg in msgs]
+
         try:
             for message in messages:
                 success = process_message(cursor, message)
+
                 if not success:
                     raise Exception(f"Failed to process message: {message.value}")
 
-            #FIRST commit DB
             conn.commit()
-
-            #THEN commit Kafka offsets
             consumer.commit()
 
             logger.info(f"Processed {len(messages)} messages successfully")
@@ -297,19 +339,26 @@ def consume_messages():
             conn.rollback()
 
 
-# Process Kafka message
 def process_message(cursor, message):
-
-    """Processes an individual Kafka message for LogException, Machine, AppVersionLog, or MachineMapping."""
     record = message.value
     table_name = message.topic
+
     columns = tables_columns.get(table_name)
+
     if not columns:
         logger.error(f"Unknown table: {table_name}")
         return False
 
-    # Convert date fields
-    date_fields = ['ModifiedDate', 'Timestamp', 'CreateDate', 'LogDate']
+    date_fields = [
+        'ModifiedDate',
+        'Timestamp',
+        'CreateDate',
+        'LogDate',
+        'CreatedDate',
+        'Modifieddate',
+        'DateTimeofResult'
+    ]
+
     for key in date_fields:
         if key in record and isinstance(record[key], str):
             try:
@@ -319,72 +368,108 @@ def process_message(cursor, message):
 
     primary_key = columns[0]
 
-    # Validate primary keys
-    if table_name == "dbo.AppVersionLog":
-        if record.get(primary_key) is None or record.get("CenterId") is None:
-            logger.error("Missing Id or CenterId in dbo.AppVersionLog")
-            return False
-    else:
-        if record.get(primary_key) is None or record.get("LocationID") is None:
-            logger.error(f"Missing LocationID in {table_name}")
-            return False
-
     try:
         # ============================
         # AppVersionLog Logic
         # ============================
         if table_name == "dbo.AppVersionLog":
-            if record.get("IsSync") != 0:
-                return True  # Already synced
+
+            if record.get("Id") is None or record.get("CenterId") is None:
+                logger.error("Missing Id or CenterId in dbo.AppVersionLog")
+                return False
 
             cursor.execute(
-                "SELECT 1 FROM dbo.AppVersionLog WHERE Id = ? AND CenterId = ?",
+                """
+                SELECT 1 
+                FROM dbo.AppVersionLog 
+                WHERE Id = ? 
+                  AND CenterId = ?
+                """,
                 (record["Id"], record["CenterId"])
             )
+
             if cursor.fetchone():
                 query = """
                     UPDATE dbo.AppVersionLog
-                    SET InstallationVersionNumber = ?, InstallationSystemName = ?, UserName = ?,
-                        InstrumentName = ?, LocationName = ?, LogDate = ?, BuildVersion = ?, BuildDate = ?, IsSync = 1
-                    WHERE Id = ? AND CenterId = ?
+                    SET 
+                        InstallationVersionNumber = ?,
+                        InstallationSystemName = ?,
+                        UserName = ?,
+                        InstrumentName = ?,
+                        LocationName = ?,
+                        LogDate = ?,
+                        BuildVersion = ?,
+                        BuildDate = ?,
+                        IsSync = 1
+                    WHERE Id = ?
+                      AND CenterId = ?
                 """
+
                 params = (
-                    record.get("InstallationVersionNumber"), record.get("InstallationSystemName"),
-                    record.get("UserName"), record.get("InstrumentName"), record.get("LocationName"),
-                    record.get("LogDate"), record.get("BuildVersion"), record.get("BuildDate"),
-                    record["Id"], record["CenterId"]
+                    record.get("InstallationVersionNumber"),
+                    record.get("InstallationSystemName"),
+                    record.get("UserName"),
+                    record.get("InstrumentName"),
+                    record.get("LocationName"),
+                    record.get("LogDate"),
+                    record.get("BuildVersion"),
+                    record.get("BuildDate"),
+                    record["Id"],
+                    record["CenterId"]
                 )
+
             else:
                 query = """
                     INSERT INTO dbo.AppVersionLog (
-                        Id, InstallationVersionNumber, InstallationSystemName, UserName,
-                        InstrumentName, LocationName, CenterId, LogDate, BuildVersion, BuildDate, IsSync
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
+                        Id,
+                        InstallationVersionNumber,
+                        InstallationSystemName,
+                        UserName,
+                        InstrumentName,
+                        LocationName,
+                        CenterId,
+                        LogDate,
+                        BuildVersion,
+                        BuildDate,
+                        IsSync
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
                 """
+
                 params = (
-                    record["Id"], record.get("InstallationVersionNumber"), record.get("InstallationSystemName"),
-                    record.get("UserName"), record.get("InstrumentName"), record.get("LocationName"),
-                    record["CenterId"], record.get("LogDate"), record.get("BuildVersion"), record.get("BuildDate")
+                    record["Id"],
+                    record.get("InstallationVersionNumber"),
+                    record.get("InstallationSystemName"),
+                    record.get("UserName"),
+                    record.get("InstrumentName"),
+                    record.get("LocationName"),
+                    record["CenterId"],
+                    record.get("LogDate"),
+                    record.get("BuildVersion"),
+                    record.get("BuildDate")
                 )
+
             cursor.execute(query, params)
             return True
 
         # ============================
-        # MachineMapping Logic (FIXED)
+        # MachineMapping Logic
         # ============================
         if table_name == "dbo.MachineMapping":
 
-            # Skip already synced or deleted records
-            if record.get("IsSync") != 0 or record.get("IsDeleted") == 1:
+            if record.get("MachineFId") is None or record.get("TestParamFID") is None or record.get("LocationID") is None:
+                logger.error("Missing MachineFId/TestParamFID/LocationID in dbo.MachineMapping")
+                return False
+
+            if record.get("IsDeleted") == 1:
                 logger.info(
-                    f"Skipping MachineMapping record "
-                    f"(MachineFId={record.get('MachineFId')}, "
+                    f"Skipping deleted MachineMapping "
+                    f"MachineFId={record.get('MachineFId')}, "
                     f"TestParamFID={record.get('TestParamFID')}, "
-                    f"LocationID={record.get('LocationID')})"
+                    f"LocationID={record.get('LocationID')}"
                 )
                 return True
 
-            # Check existence using BUSINESS KEY (NOT Id)
             cursor.execute(
                 """
                 SELECT 1
@@ -401,7 +486,6 @@ def process_message(cursor, message):
             )
 
             if cursor.fetchone():
-                # UPDATE (do NOT overwrite CreateDate or Id)
                 update_cols = [
                     f"{col} = ?"
                     for col in columns
@@ -417,82 +501,193 @@ def process_message(cursor, message):
                 """
 
                 params = (
-                        [record.get(col, None) for col in columns if col not in ("Id", "CreateDate")]
-                        + [
-                            record["MachineFId"],
-                            record["TestParamFID"],
-                            record["LocationID"]
-                        ]
+                    [record.get(col, None) for col in columns if col not in ("Id", "CreateDate")]
+                    + [
+                        record["MachineFId"],
+                        record["TestParamFID"],
+                        record["LocationID"]
+                    ]
                 )
+
             else:
-                # INSERT new mapping
                 query = f"""
                     INSERT INTO dbo.MachineMapping
                     ({', '.join(columns)})
                     VALUES ({', '.join(['?'] * len(columns))})
                 """
+
                 params = [record.get(col, None) for col in columns]
 
             cursor.execute(query, params)
             return True
 
         # ============================
-        # Generic tables (LogException, Machine, QCIntegrationTable, etc.)
+        # MachineParameters Logic
         # ============================
+        if table_name == "dbo.MachineParameters":
+
+            if record.get("Id") is None or record.get("LocationID") is None:
+                logger.error("Missing Id or LocationID in dbo.MachineParameters")
+                return False
+
+            cursor.execute(
+                """
+                SELECT 1
+                FROM dbo.MachineParameters
+                WHERE Id = ?
+                  AND LocationID = ?
+                """,
+                (
+                    record["Id"],
+                    record["LocationID"]
+                )
+            )
+
+            if cursor.fetchone():
+                query = """
+                    UPDATE dbo.MachineParameters
+                    SET
+                        Parameter = ?,
+                        isDeleted = ?,
+                        ParmeterHeader = ?,
+                        MachineFID = ?,
+                        ConfigMachineDataFID = ?,
+                        ValueField = ?,
+                        TestField = ?,
+                        LISParamName = ?,
+                        CreateDate = ?,
+                        ModifiedDate = ?
+                    WHERE Id = ?
+                      AND LocationID = ?
+                """
+
+                params = (
+                    record.get("Parameter"),
+                    record.get("isDeleted"),
+                    record.get("ParmeterHeader"),
+                    record.get("MachineFID"),
+                    record.get("ConfigMachineDataFID"),
+                    record.get("ValueField"),
+                    record.get("TestField"),
+                    record.get("LISParamName"),
+                    record.get("CreateDate"),
+                    record.get("ModifiedDate"),
+                    record["Id"],
+                    record["LocationID"]
+                )
+
+            else:
+                query = """
+                    INSERT INTO dbo.MachineParameters (
+                        Id,
+                        Parameter,
+                        isDeleted,
+                        ParmeterHeader,
+                        MachineFID,
+                        ConfigMachineDataFID,
+                        ValueField,
+                        TestField,
+                        LISParamName,
+                        CreateDate,
+                        ModifiedDate,
+                        LocationID
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """
+
+                params = (
+                    record.get("Id"),
+                    record.get("Parameter"),
+                    record.get("isDeleted"),
+                    record.get("ParmeterHeader"),
+                    record.get("MachineFID"),
+                    record.get("ConfigMachineDataFID"),
+                    record.get("ValueField"),
+                    record.get("TestField"),
+                    record.get("LISParamName"),
+                    record.get("CreateDate"),
+                    record.get("ModifiedDate"),
+                    record.get("LocationID")
+                )
+
+            cursor.execute(query, params)
+            logger.info(
+                f"MachineParameters synced successfully: "
+                f"Id={record.get('Id')}, LocationID={record.get('LocationID')}"
+            )
+            return True
+
+        # ============================
+        # Generic tables
+        # ============================
+        if record.get(primary_key) is None or record.get("LocationID") is None:
+            logger.error(f"Missing {primary_key} or LocationID in {table_name}")
+            return False
+
         location_id = record["LocationID"]
-        cursor.execute(f"SELECT 1 FROM {table_name} WHERE {primary_key} = ? AND LocationID = ?",
-                       (record[primary_key], location_id))
+
+        cursor.execute(
+            f"""
+            SELECT 1 
+            FROM {table_name} 
+            WHERE {primary_key} = ? 
+              AND LocationID = ?
+            """,
+            (record[primary_key], location_id)
+        )
+
         if cursor.fetchone():
-            update_cols = [f"{col} = ?" for col in columns if col != primary_key]
-            query = f"UPDATE {table_name} SET {', '.join(update_cols)} WHERE {primary_key} = ? AND LocationID = ?"
-            params = [record.get(col, None) for col in columns if col != primary_key] + [record[primary_key], location_id]
+            update_cols = [
+                f"{col} = ?"
+                for col in columns
+                if col != primary_key
+            ]
+
+            query = f"""
+                UPDATE {table_name}
+                SET {', '.join(update_cols)}
+                WHERE {primary_key} = ?
+                  AND LocationID = ?
+            """
+
+            params = (
+                [record.get(col, None) for col in columns if col != primary_key]
+                + [record[primary_key], location_id]
+            )
+
         else:
-            query = f"INSERT INTO {table_name} ({', '.join(columns)}) VALUES ({', '.join(['?'] * len(columns))})"
+            query = f"""
+                INSERT INTO {table_name}
+                ({', '.join(columns)})
+                VALUES ({', '.join(['?'] * len(columns))})
+            """
+
             params = [record.get(col, None) for col in columns]
+
         cursor.execute(query, params)
         return True
 
     except pyodbc.Error as e:
         logger.error(f"Database error in {table_name}: {str(e)}")
         raise
+
     except Exception as e:
         logger.error(f"Processing error in {table_name}: {str(e)}")
         return False
-
-# Retries Ack from central consumer to producer
-def send_ack_with_retry(ack_producer, topic, ack_message, max_retries=5):
-
-    retry = 0
-    while retry < max_retries:
-        try:
-            ack_producer.send(topic, ack_message)
-            ack_producer.flush()
-            logger.info(f"Ack sent for {ack_message['table']} ID {ack_message['record_id']}")
-            return True
-
-        except Exception as e:
-            retry += 1
-            delay = 2 ** retry  # exponential backoff
-            logger.error(f"Failed to send ack (attempt {retry}/{max_retries}): {e}. Retrying in {delay}s...")
-            time.sleep(delay)
-
-    logger.error(f"Giving up sending ack after {max_retries} attempts for {ack_message['table']} ID {ack_message['record_id']}")
-    # Optionally store ack_message in a persistent retry table for manual or background retries
-    return False
 
 
 if __name__ == "__main__":
     signal.signal(signal.SIGINT, handle_interrupt)
     signal.signal(signal.SIGTERM, handle_shutdown)
 
-    # Start the heartbeat monitoring in a separate thread
-    threading.Thread(target=monitor_producer_heartbeat, daemon=True).start()
+    threading.Thread(
+        target=monitor_producer_heartbeat,
+        daemon=True
+    ).start()
 
-    # Start the periodic cleanup of dead producers in a separate thread
-    threading.Thread(target=mark_producers_as_dead, daemon=True).start()
+    threading.Thread(
+        target=mark_producers_as_dead,
+        daemon=True
+    ).start()
 
-    # Start the thread for Ack from central consumer to producer
-
-
-    # Start the Kafka consumer
     consume_messages()
