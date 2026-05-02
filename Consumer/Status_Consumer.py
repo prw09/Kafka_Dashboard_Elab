@@ -138,7 +138,8 @@ tables_columns = {
         'LISParamName',
         'CreateDate',
         'ModifiedDate',
-        'LocationID'
+        'LocationID',
+        'IsSync'
     ]
 }
 
@@ -556,7 +557,8 @@ def process_message(cursor, message):
                         TestField = ?,
                         LISParamName = ?,
                         CreateDate = ?,
-                        ModifiedDate = ?
+                        ModifiedDate = ?,
+                        IsSync = 1
                     WHERE Id = ?
                       AND LocationID = ?
                 """
@@ -572,6 +574,7 @@ def process_message(cursor, message):
                     record.get("LISParamName"),
                     record.get("CreateDate"),
                     record.get("ModifiedDate"),
+                    # IsSync is hardcoded as 1 in query, no param needed
                     record["Id"],
                     record["LocationID"]
                 )
@@ -590,9 +593,10 @@ def process_message(cursor, message):
                         LISParamName,
                         CreateDate,
                         ModifiedDate,
-                        LocationID
+                        LocationID,
+                        IsSync
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
                 """
 
                 params = (
@@ -607,7 +611,8 @@ def process_message(cursor, message):
                     record.get("LISParamName"),
                     record.get("CreateDate"),
                     record.get("ModifiedDate"),
-                    record.get("LocationID")
+                    record.get("LocationID"),
+                    # IsSync hardcoded as 1 in query, no param needed
                 )
 
             cursor.execute(query, params)
