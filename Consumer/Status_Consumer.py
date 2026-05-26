@@ -94,38 +94,53 @@ CORS(app)
 
 tables_columns = {
     "dbo.LogException": [
-        'ID', 'MachineFID', 'MessageString', 'Timestamp', 'LogType',
-        'ErrorCode', 'ModifiedDate', 'LocationID', 'IsSync'
+        'ID', 'MachineFID',
+        'MessageString', 'Timestamp',
+        'LogType', 'ErrorCode', 'ModifiedDate',
+        'LocationID', 'IsSync'
     ],
 
     "dbo.Machine": [
-        'ID', 'MachineName', 'LocationID', 'CategoryID', 'ConnectionMode',
-        'QCStatus', 'CreateDate', 'ModifiedDate', 'IsSync',
+        'ID', 'MachineName', 'LocationID',
+        'CategoryID', 'ConnectionMode',
+        'QCStatus', 'CreateDate',
+        'ModifiedDate', 'IsSync',
         'InstrumentId', 'IsDeleted'
     ],
 
     "dbo.QCIntegrationTable": [
-        'QCID', 'SenderName', 'DateTimeofResult', 'LotID', 'ControlLevel',
-        'QCBottleNo', 'ActionCode', 'SampleType', 'Parameter', 'Dilution',
-        'ResultValue', 'Unit', 'ReferenceRange', 'Flags', 'RerunFlags',
-        'OperatorID', 'Comment1', 'Comment2', 'MachineFid', 'InstrumentID',
-        'LocationId', 'Dbstatus', 'CreatedDate', 'Modifieddate', 'IsSync'
+        'QCID', 'SenderName', 'DateTimeofResult',
+        'LotID', 'ControlLevel',
+        'QCBottleNo', 'ActionCode', 'SampleType',
+        'Parameter', 'Dilution',
+        'ResultValue', 'Unit', 'ReferenceRange',
+        'Flags', 'RerunFlags',
+        'OperatorID', 'Comment1', 'Comment2',
+        'MachineFid', 'InstrumentID',
+        'LocationId', 'Dbstatus', 'CreatedDate',
+        'Modifieddate', 'IsSync'
     ],
 
     "dbo.AppVersionLog": [
-        'Id', 'InstallationVersionNumber', 'InstallationSystemName',
-        'UserName', 'InstrumentName', 'LocationName', 'CenterId',
-        'LogDate', 'BuildVersion', 'BuildDate', 'IsSync'
+        'Id', 'InstallationVersionNumber',
+        'InstallationSystemName',
+        'UserName', 'InstrumentName',
+        'LocationName', 'CenterId',
+        'LogDate', 'BuildVersion',
+        'BuildDate', 'IsSync'
     ],
 
     "dbo.MachineMapping": [
-        'Id', 'MachineFId', 'ConfigMachineDataFID', 'ParameterFId',
-        'pFrom', 'pTo', 'TestParamFID', 'Expression', 'DecimalPlaces',
-        'CheckField', 'test', 'postfix', 'SampleType', 'IsDeleted',
-        'CreateDate', 'ModifiedDate', 'TestFID', 'LocationID', 'IsSync'
+        'Id', 'MachineFId', 'ConfigMachineDataFID',
+        'ParameterFId',
+        'pFrom', 'pTo', 'TestParamFID',
+        'Expression', 'DecimalPlaces',
+        'CheckField', 'test', 'postfix',
+        'SampleType', 'IsDeleted',
+        'CreateDate', 'ModifiedDate', 'TestFID',
+        'LocationID', 'IsSync'
     ],
 
-    # NEW TABLE ADDED FOR SYNC
     "dbo.MachineParameters": [
         'Id',
         'Parameter',
@@ -138,9 +153,43 @@ tables_columns = {
         'LISParamName',
         'CreateDate',
         'ModifiedDate',
+        'LocationID'
+    ],
+
+    "ConfigMachineData": [
+        'ConfigMachineDataId',
+        'FormatDetails',
+        'MachinFID',
+        'TestName',
+        'TestFID',
+        'ResultMatchField',
+        'MachineResultParam',
+        'MachineResultSegment',
+        'pFrom',
+        'pTo',
+        'OrderMatchField',
+        'MachineOrdertParam',
+        'MachineOrderSegment',
+        'OrderLevel',
+        'OrderFieldName',
+        'CategoryFID',
+        'TimeInterval',
+        'Querymode',
+        'SubResultSegment',
+        'CreateDate',
+        'ModifiedDate',
         'LocationID',
         'IsSync'
-    ]
+    ],
+
+    "dbo.CategoryMaster": [
+        'CategoryID',
+        'CategoryName',
+        'CreateDate',
+        'ModifiedDate',
+        'LocationID',
+        'IsSync'
+    ],
 }
 
 
@@ -304,6 +353,7 @@ def consume_messages():
         "dbo.AppVersionLog",
         "dbo.MachineMapping",
         "dbo.MachineParameters",
+        "dbo.CategoryMaster",
         bootstrap_servers=KAFKA_BOOTSTRAP,
         value_deserializer=lambda x: json.loads(x.decode('utf-8')),
         enable_auto_commit=False,
@@ -557,8 +607,7 @@ def process_message(cursor, message):
                         TestField = ?,
                         LISParamName = ?,
                         CreateDate = ?,
-                        ModifiedDate = ?,
-                        IsSync = 1
+                        ModifiedDate = ?
                     WHERE Id = ?
                       AND LocationID = ?
                 """
@@ -574,7 +623,6 @@ def process_message(cursor, message):
                     record.get("LISParamName"),
                     record.get("CreateDate"),
                     record.get("ModifiedDate"),
-                    # IsSync is hardcoded as 1 in query, no param needed
                     record["Id"],
                     record["LocationID"]
                 )
@@ -593,10 +641,9 @@ def process_message(cursor, message):
                         LISParamName,
                         CreateDate,
                         ModifiedDate,
-                        LocationID,
-                        IsSync
+                        LocationID
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """
 
                 params = (
@@ -611,14 +658,68 @@ def process_message(cursor, message):
                     record.get("LISParamName"),
                     record.get("CreateDate"),
                     record.get("ModifiedDate"),
-                    record.get("LocationID"),
-                    # IsSync hardcoded as 1 in query, no param needed
+                    record.get("LocationID")
                 )
 
             cursor.execute(query, params)
             logger.info(
                 f"MachineParameters synced successfully: "
                 f"Id={record.get('Id')}, LocationID={record.get('LocationID')}"
+            )
+            return True
+
+        # ============================
+        # CategoryMaster Logic (Insert Only)
+        # ============================
+        if table_name == "dbo.CategoryMaster":
+
+            if record.get("CategoryID") is None:
+                logger.error("Missing CategoryID in dbo.CategoryMaster")
+                return False
+
+            cursor.execute(
+                """
+                SELECT 1
+                FROM dbo.CategoryMaster
+                WHERE CategoryID = ?
+                """,
+                (record["CategoryID"],)
+            )
+
+            if cursor.fetchone():
+                logger.info(
+                    f"CategoryMaster record already exists, skipping insert: "
+                    f"CategoryID={record.get('CategoryID')}, "
+                    f"CategoryName={record.get('CategoryName')}"
+                )
+                return True  # skip silently, no update
+
+            query = """
+                INSERT INTO dbo.CategoryMaster (
+                    CategoryID,
+                    CategoryName,
+                    CreateDate,
+                    ModifiedDate,
+                    LocationID,
+                    IsSync
+                )
+                VALUES (?, ?, ?, ?, ?, ?)
+            """
+
+            params = (
+                record.get("CategoryID"),
+                record.get("CategoryName"),
+                record.get("CreateDate"),
+                record.get("ModifiedDate"),
+                record.get("LocationID"),
+                record.get("IsSync")
+            )
+
+            cursor.execute(query, params)
+            logger.info(
+                f"CategoryMaster inserted successfully: "
+                f"CategoryID={record.get('CategoryID')}, "
+                f"CategoryName={record.get('CategoryName')}"
             )
             return True
 
