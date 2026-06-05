@@ -206,13 +206,9 @@ def get_machine_status_data():
         cursor2.close()
 
         disconnected = []
-        location_map = {}   # LocationID → {name, machines: []}
+        location_map = {}
 
         for r in rows:
-            # Column order from SP TaskID=2:
-            # MachineName, LocationName, CategoryName, ConnectionMode, QCStatus,
-            # MachineID, LocationID, Indicator, TroubleShoot, MessageString,
-            # LogType, BuildVersion, BuildDate
             machine_name    = r[0]
             location_name   = r[1]
             category_name   = r[2]
@@ -239,11 +235,11 @@ def get_machine_status_data():
                 "message_string":  message_string,
                 "log_type":        log_type,
                 "build_version":   build_version,
-                "build_date":      build_date.strftime("%d-%m-%Y") if build_date else "N/A",
+                # ── FIX: build_date may come as string or datetime from DB ──
+                "build_date":      build_date.strftime("%d-%m-%Y") if build_date and hasattr(build_date, 'strftime') else (build_date if build_date else "N/A"),
             }
             disconnected.append(machine)
 
-            # Group by location for the breakdown table
             if location_id not in location_map:
                 location_map[location_id] = {
                     "location_name": location_name or "Unknown",
@@ -251,7 +247,6 @@ def get_machine_status_data():
                 }
             location_map[location_id]["machines"].append(machine)
 
-        # Build location_stats list (sorted by location name A→Z)
         location_stats = sorted(
             [
                 {
@@ -270,6 +265,7 @@ def get_machine_status_data():
     except pyodbc.Error as e:
         logger.error(f"Error fetching machine status data: {e}")
         return 0, 0, 0, [], []
+
     finally:
         conn.close()
 
@@ -279,7 +275,7 @@ def get_machine_status_data():
 # ════════════════════════════════════════════════════════════════════════════
 
 def build_machine_status_email():
-    """Build full HTML email with machine status report."""
+    """Build full HTML email with machine status report — iOS friendly."""
 
     total, total_online, total_offline, location_stats, disconnected = get_machine_status_data()
     now_str = datetime.now().strftime("%d %b %Y %H:%M")
@@ -287,25 +283,23 @@ def build_machine_status_email():
 
     slot_label = "Morning Report"
 
-    # ── Location-wise breakdown: each location + its offline machines ─────
+    # ── Location-wise breakdown ───────────────────────────────────────────
     location_blocks_html = ""
 
     if location_stats:
         for loc_idx, loc in enumerate(location_stats):
-            # Location header row
             location_blocks_html += f"""
             <tr style="background:#1a3c78;">
-                <td colspan="3"
-                    style="padding:10px 14px; border:1px solid #2c5f9e;
-                           color:#fff; font-weight:bold; font-size:13px;">
+                <td colspan="2"
+                    style="padding:8px 10px; border:1px solid #2c5f9e;
+                           color:#fff; font-weight:bold; font-size:12px;">
                     📍 {loc['location_name']}
-                    <span style="font-weight:normal; font-size:12px; color:#a8c4f0;">
-                        &nbsp;—&nbsp; {loc['offline_count']} machine(s) offline
+                    <span style="font-weight:normal; font-size:11px; color:#a8c4f0;">
+                        &nbsp;—&nbsp; {loc['offline_count']} offline
                     </span>
                 </td>
             </tr>"""
 
-            # One row per offline machine under this location
             for m_idx, m in enumerate(loc["machines"]):
                 bg = "#fff5f5" if m_idx % 2 == 0 else "#ffffff"
                 message_cell = (
@@ -315,56 +309,53 @@ def build_machine_status_email():
                 )
                 location_blocks_html += f"""
                 <tr style="background:{bg};">
-                    <td style="padding:9px 14px; border:1px solid #f0d0d0;
-                               text-align:center; color:#888; font-size:12px;">
-                        {m['machine_id']}
-                    </td>
-                    <td style="padding:9px 14px; border:1px solid #f0d0d0; font-weight:bold;">
+                    <td style="padding:8px 10px; border:1px solid #f0d0d0;
+                               font-weight:bold; font-size:12px; width:50%;">
                         🔴 {m['machine_name']}
-                        <div style="font-size:11px; color:#888; font-weight:normal;">
-                            {m['category_name']} &nbsp;|&nbsp; v{m['build_version']}
+                        <div style="font-size:10px; color:#888; font-weight:normal;">
+                            ID: {m['machine_id']} &nbsp;|&nbsp; {m['category_name']}
+                        </div>
+                        <div style="font-size:10px; color:#aaa; font-weight:normal;">
+                            v{m['build_version']}
                         </div>
                     </td>
-                    <td style="padding:9px 14px; border:1px solid #f0d0d0;">
+                    <td style="padding:8px 10px; border:1px solid #f0d0d0;
+                               font-size:11px; width:50%; vertical-align:top;">
                         {message_cell}
                     </td>
                 </tr>"""
 
-        # Spacer between location groups
         location_blocks_html += """
             <tr>
-                <td colspan="3"
-                    style="padding:4px; background:#f0f4f8; border:none;">
-                </td>
+                <td colspan="2" style="padding:4px; background:#f0f4f8; border:none;"></td>
             </tr>"""
 
     else:
         location_blocks_html = """
             <tr>
-                <td colspan="3"
-                    style="padding:16px; text-align:center; color:#1e8a2e;
-                           font-weight:bold;">
+                <td colspan="2"
+                    style="padding:16px; text-align:center; color:#1e8a2e; font-weight:bold;">
                     ✅ All machines are online!
                 </td>
             </tr>"""
 
-    # ── Offline section (location + machine table) ────────────────────────
+    # ── Offline section ───────────────────────────────────────────────────
     if disconnected:
         offline_section = f"""
-        <h3 style="color:#cc0000; margin-top:32px; font-family:Arial,sans-serif;">
+        <p style="color:#cc0000; font-weight:bold; font-size:13px;
+                  margin-top:24px; font-family:Arial,sans-serif;">
             🔴 Location-wise Offline Breakdown — {total_offline} machine(s) offline
-        </h3>
-        <table style="border-collapse:collapse; width:100%; max-width:780px;
-                      font-family:Arial,sans-serif; font-size:13px;">
+        </p>
+        <table style="border-collapse:collapse; width:100%;
+                      font-family:Arial,sans-serif; font-size:12px; table-layout:fixed;">
             <thead>
                 <tr style="background:#cc0000; color:#fff;">
-                    <th style="padding:10px 14px; border:1px solid #f0d0d0; width:80px;">
-                        Machine ID
-                    </th>
-                    <th style="padding:10px 14px; border:1px solid #f0d0d0; text-align:left;">
+                    <th style="padding:8px 10px; border:1px solid #f0d0d0;
+                               text-align:left; width:50%;">
                         Machine Name
                     </th>
-                    <th style="padding:10px 14px; border:1px solid #f0d0d0; text-align:left;">
+                    <th style="padding:8px 10px; border:1px solid #f0d0d0;
+                               text-align:left; width:50%;">
                         Last Message
                     </th>
                 </tr>
@@ -375,10 +366,10 @@ def build_machine_status_email():
         </table>"""
     else:
         offline_section = """
-        <div style="margin-top:28px; padding:16px 24px; background:#e6f4ea;
+        <div style="margin-top:20px; padding:14px 18px; background:#e6f4ea;
                     border-left:5px solid #1e8a2e; border-radius:4px;
                     font-family:Arial,sans-serif;">
-            <strong style="color:#1e8a2e; font-size:15px;">
+            <strong style="color:#1e8a2e; font-size:14px;">
                 ✅ All machines are currently Online!
             </strong>
         </div>"""
@@ -387,70 +378,96 @@ def build_machine_status_email():
     body = f"""
     <!DOCTYPE html>
     <html>
-    <body style="margin:0; padding:24px; background:#f0f4f8;
-                 font-family:Arial,sans-serif; color:#333;">
+    <head>
+        <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+        <meta http-equiv="Content-Type" content="text/html; charset=UTF-8"/>
+    </head>
+    <body style="margin:0; padding:8px; background:#f0f4f8;
+                 font-family:Arial,sans-serif; color:#333; -webkit-text-size-adjust:100%;">
 
-        <!-- Header -->
-        <div style="background:#1a3c78; padding:20px 28px; border-radius:8px 8px 0 0;">
-            <h2 style="margin:0; color:#fff; font-size:20px;">
-                📊 Machine Status Report &nbsp;·&nbsp; {slot_label}
-            </h2>
-            <p style="margin:4px 0 0; color:#a8c4f0; font-size:13px;">{now_str}</p>
-        </div>
+        <table width="100%" cellpadding="0" cellspacing="0"
+               style="max-width:600px; margin:0 auto;">
+            <tr>
+                <td>
 
-        <!-- Content card -->
-        <div style="background:#fff; padding:28px; border-radius:0 0 8px 8px;
-                    box-shadow:0 2px 8px rgba(0,0,0,0.08);">
+                    <!-- Header -->
+                    <div style="background:#1a3c78; padding:16px 18px;
+                                border-radius:8px 8px 0 0;">
+                        <div style="color:#fff; font-size:17px; font-weight:bold;">
+                            📊 Machine Status Report
+                        </div>
+                        <div style="color:#a8c4f0; font-size:12px; margin-top:4px;">
+                            {slot_label} &nbsp;·&nbsp; {now_str}
+                        </div>
+                    </div>
 
-            <!-- Summary cards -->
-            <table style="border-collapse:separate; border-spacing:14px; margin-bottom:8px;">
-                <tr>
-                    <td style="background:#e8f0fe; padding:16px 32px; border-radius:8px;
-                               text-align:center; min-width:100px;">
-                        <div style="font-size:12px; color:#555; margin-bottom:4px;">
-                            Total Machines
-                        </div>
-                        <div style="font-size:32px; font-weight:bold; color:#1a3c78;">
-                            {total}
-                        </div>
-                    </td>
-                    <td style="background:#e6f4ea; padding:16px 32px; border-radius:8px;
-                               text-align:center; min-width:100px;">
-                        <div style="font-size:12px; color:#555; margin-bottom:4px;">
-                            🟢 Online
-                        </div>
-                        <div style="font-size:32px; font-weight:bold; color:#1e8a2e;">
-                            {total_online}
-                        </div>
-                    </td>
-                    <td style="background:#fce8e6; padding:16px 32px; border-radius:8px;
-                               text-align:center; min-width:100px;">
-                        <div style="font-size:12px; color:#555; margin-bottom:4px;">
-                            🔴 Offline
-                        </div>
-                        <div style="font-size:32px; font-weight:bold; color:#cc0000;">
-                            {total_offline}
-                        </div>
-                    </td>
-                </tr>
-            </table>
+                    <!-- Content card -->
+                    <div style="background:#fff; padding:16px 18px;
+                                border-radius:0 0 8px 8px;">
 
-            <!-- Location-wise offline breakdown -->
-            {offline_section}
+                        <!-- Summary cards — stacked for mobile -->
+                        <table width="100%" cellpadding="0" cellspacing="0"
+                               style="margin-bottom:16px;">
+                            <tr>
+                                <td style="padding:4px;">
+                                    <div style="background:#e8f0fe; padding:12px 8px;
+                                                border-radius:8px; text-align:center;">
+                                        <div style="font-size:11px; color:#555;">
+                                            Total Machines
+                                        </div>
+                                        <div style="font-size:28px; font-weight:bold;
+                                                    color:#1a3c78;">
+                                            {total}
+                                        </div>
+                                    </div>
+                                </td>
+                                <td style="padding:4px;">
+                                    <div style="background:#e6f4ea; padding:12px 8px;
+                                                border-radius:8px; text-align:center;">
+                                        <div style="font-size:11px; color:#555;">
+                                            🟢 Online
+                                        </div>
+                                        <div style="font-size:28px; font-weight:bold;
+                                                    color:#1e8a2e;">
+                                            {total_online}
+                                        </div>
+                                    </div>
+                                </td>
+                                <td style="padding:4px;">
+                                    <div style="background:#fce8e6; padding:12px 8px;
+                                                border-radius:8px; text-align:center;">
+                                        <div style="font-size:11px; color:#555;">
+                                            🔴 Offline
+                                        </div>
+                                        <div style="font-size:28px; font-weight:bold;
+                                                    color:#cc0000;">
+                                            {total_offline}
+                                        </div>
+                                    </div>
+                                </td>
+                            </tr>
+                        </table>
 
-            <!-- Footer -->
-            <p style="margin-top:36px; color:#bbb; font-size:11px;
-                      border-top:1px solid #eee; padding-top:12px;">
-                Generated at {gen_str} &nbsp;|&nbsp; Consumer2 Machine Monitor
-                &nbsp;|&nbsp; Report Schedule: 10:00 AM Daily
-            </p>
+                        <!-- Offline breakdown -->
+                        {offline_section}
 
-        </div>
+                        <!-- Footer -->
+                        <p style="margin-top:24px; color:#bbb; font-size:10px;
+                                  border-top:1px solid #eee; padding-top:10px;">
+                            Generated at {gen_str} &nbsp;|&nbsp; Consumer2 Machine Monitor
+                            &nbsp;|&nbsp; Report Schedule: 10:00 AM Daily
+                        </p>
+
+                    </div>
+                </td>
+            </tr>
+        </table>
+
     </body>
     </html>
     """
-    return body
 
+    return body
 
 # ════════════════════════════════════════════════════════════════════════════
 #  EMAIL SENDERS
