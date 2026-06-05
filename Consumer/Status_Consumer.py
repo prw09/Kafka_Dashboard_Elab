@@ -23,11 +23,12 @@ load_dotenv()
 KAFKA_BOOTSTRAP          = os.getenv("KAFKA_BOOTSTRAP_SERVERS")
 PRODUCER_TIMEOUT_SECONDS = os.getenv("PRODUCER_TIMEOUT_SECONDS")
 
-# Report times: 10:00 AM, 1:30 PM, 7:00 PM
-REPORT_TIMES = ["10:00", "13:30", "19:00"]
+# Report times: 10:00 AM daily
+REPORT_TIMES = ["10:00"]
+
 
 # ─── Logging setup ───────────────────────────────────────────────────────────
-LOG_DIR   = os.path.join(os.path.dirname(__file__), "logs")
+LOG_DIR = os.path.join(os.path.dirname(__file__), "logs")
 os.makedirs(LOG_DIR, exist_ok=True)
 
 LOG_LEVEL  = os.getenv("LOG_LEVEL", "INFO").upper()
@@ -67,7 +68,7 @@ logger.propagate = False
 # ─── Email configuration ─────────────────────────────────────────────────────
 EMAIL_SENDER   = os.getenv("EMAIL_SENDER")
 EMAIL_PASSWORD = os.getenv("EMAIL_PASSWORD")
-EMAIL_RECEIVER = "kaustubhwandile@gmail.com"
+EMAIL_RECEIVER = os.getenv("EMAIL_RECEIVER", "kaustubhwandile@gmail.com")
 SMTP_SERVER    = os.getenv("SMTP_SERVER")
 SMTP_PORT      = os.getenv("SMTP_PORT")
 
@@ -171,111 +172,98 @@ def get_db_connection():
 
 
 # ════════════════════════════════════════════════════════════════════════════
-#  MACHINE STATUS QUERIES  (uses dbo.LogException for machine status)
+#  MACHINE STATUS QUERIES  (uses dbo.GetMachineInformationForEmail SP)
 # ════════════════════════════════════════════════════════════════════════════
 
 def get_machine_status_data():
-
     """
-    Returns machine status using dbo.LogException.
-    A machine is considered ONLINE  if its latest LogException has LogType = 'Connected'
-                             OFFLINE if its latest LogException has LogType = 'Disconnected'
-                                     OR if it has no log entry at all.
+    Calls dbo.GetMachineInformationForEmail:
+        @TaskID = 1  → Total / Online / Offline counts
+        @TaskID = 2  → Offline machine list with location, name, etc.
 
     Returns:
         total          (int)
         total_online   (int)
         total_offline  (int)
-        location_stats (list of dicts)  — per location breakdown
+        location_stats (list of dicts)  — per-location breakdown built from offline list
         disconnected   (list of dicts)  — offline machine details
     """
     conn = get_db_connection()
-    cursor = conn.cursor()
     try:
-        # ── Latest log entry per machine ──────────────────────────────────
-        # We grab each machine, join to the most recent LogException row,
-        # and decide online/offline from LogType.
-        cursor.execute("""
-            SELECT
-                M.ID                                        AS MachineID,
-                M.MachineName,
-                M.LocationID,
-                ISNULL(L.LocationName, 'Unknown')           AS LocationName,
-                LE.LogType,
-                LE.Timestamp                                AS LastLogTime
-            FROM dbo.Machine M
-            LEFT JOIN dbo.Location L
-                ON L.LocationID = M.LocationID
-            LEFT JOIN (
-                SELECT MachineFID,
-                       LogType,
-                       Timestamp,
-                       ROW_NUMBER() OVER (
-                           PARTITION BY MachineFID
-                           ORDER BY Timestamp DESC
-                       ) AS rn
-                FROM dbo.LogException
-            ) LE ON LE.MachineFID = M.ID AND LE.rn = 1
-            WHERE M.IsDeleted = 0
-            ORDER BY LocationName, M.MachineName
-        """)
+        # ── TaskID = 1 : Summary counts ───────────────────────────────────
+        cursor1 = conn.cursor()
+        cursor1.execute("EXEC dbo.GetMachineInformationForEmail @TaskID = 1")
+        row           = cursor1.fetchone()
+        total         = int(row[0]) if row else 0
+        total_online  = int(row[1]) if row else 0
+        total_offline = int(row[2]) if row else 0
+        cursor1.close()
 
-        rows = cursor.fetchall()
+        # ── TaskID = 2 : Offline machine list ─────────────────────────────
+        cursor2 = conn.cursor()
+        cursor2.execute("EXEC dbo.GetMachineInformationForEmail @TaskID = 2")
+        rows = cursor2.fetchall()
+        cursor2.close()
 
-        all_machines    = []
-        disconnected    = []
-        location_map    = {}   # LocationID → {name, total, online, offline}
+        disconnected = []
+        location_map = {}   # LocationID → {name, machines: []}
 
-        for row in rows:
-            machine_id    = row[0]
-            machine_name  = row[1]
-            location_id   = row[2]
-            location_name = row[3]
-            log_type      = row[4]   # 'Connected' / 'Disconnected' / None
-            last_log_time = row[5]
-
-            # Determine status
-            is_online = (log_type is not None and
-                         log_type.strip().lower() == 'connected')
+        for r in rows:
+            # Column order from SP TaskID=2:
+            # MachineName, LocationName, CategoryName, ConnectionMode, QCStatus,
+            # MachineID, LocationID, Indicator, TroubleShoot, MessageString,
+            # LogType, BuildVersion, BuildDate
+            machine_name    = r[0]
+            location_name   = r[1]
+            category_name   = r[2]
+            connection_mode = r[3]
+            qc_status       = r[4]
+            machine_id      = r[5]
+            location_id     = r[6]
+            indicator       = r[7]
+            troubleshoot    = r[8]  or ""
+            message_string  = r[9]  or ""
+            log_type        = r[10]
+            build_version   = r[11] or "N/A"
+            build_date      = r[12]
 
             machine = {
-                "machine_id":    machine_id,
-                "machine_name":  machine_name,
-                "location_id":   location_id,
-                "location_name": location_name,
-                "status":        "Online" if is_online else "Offline",
-                "last_log_time": last_log_time.strftime("%d-%m-%Y %H:%M:%S")
-                                  if last_log_time else "No log found",
-                "log_type":      log_type or "No log"
+                "machine_id":      machine_id,
+                "machine_name":    machine_name    or "Unknown",
+                "location_id":     location_id,
+                "location_name":   location_name   or "Unknown",
+                "category_name":   category_name   or "N/A",
+                "connection_mode": connection_mode or "N/A",
+                "qc_status":       qc_status       or "N/A",
+                "troubleshoot":    troubleshoot,
+                "message_string":  message_string,
+                "log_type":        log_type,
+                "build_version":   build_version,
+                "build_date":      build_date.strftime("%d-%m-%Y") if build_date else "N/A",
             }
-            all_machines.append(machine)
+            disconnected.append(machine)
 
-            if not is_online:
-                disconnected.append(machine)
-
-            # Build per-location aggregation
+            # Group by location for the breakdown table
             if location_id not in location_map:
                 location_map[location_id] = {
-                    "location_name": location_name,
-                    "total":   0,
-                    "online":  0,
-                    "offline": 0
+                    "location_name": location_name or "Unknown",
+                    "machines":      []
                 }
-            location_map[location_id]["total"]  += 1
-            if is_online:
-                location_map[location_id]["online"]  += 1
-            else:
-                location_map[location_id]["offline"] += 1
+            location_map[location_id]["machines"].append(machine)
 
+        # Build location_stats list (sorted by location name A→Z)
         location_stats = sorted(
-            location_map.values(),
-            key=lambda x: x["total"],
-            reverse=True
+            [
+                {
+                    "location_id":   lid,
+                    "location_name": v["location_name"],
+                    "offline_count": len(v["machines"]),
+                    "machines":      v["machines"],
+                }
+                for lid, v in location_map.items()
+            ],
+            key=lambda x: x["location_name"]
         )
-
-        total         = len(all_machines)
-        total_online  = sum(1 for m in all_machines if m["status"] == "Online")
-        total_offline = total - total_online
 
         return total, total_online, total_offline, location_stats, disconnected
 
@@ -283,7 +271,6 @@ def get_machine_status_data():
         logger.error(f"Error fetching machine status data: {e}")
         return 0, 0, 0, [], []
     finally:
-        cursor.close()
         conn.close()
 
 
@@ -295,104 +282,99 @@ def build_machine_status_email():
     """Build full HTML email with machine status report."""
 
     total, total_online, total_offline, location_stats, disconnected = get_machine_status_data()
-    now_str   = datetime.now().strftime("%d %b %Y %H:%M")
-    gen_str   = datetime.now().strftime("%d-%m-%Y %H:%M:%S")
+    now_str = datetime.now().strftime("%d %b %Y %H:%M")
+    gen_str = datetime.now().strftime("%d-%m-%Y %H:%M:%S")
 
-    # Determine report slot label
-    hour = datetime.now().hour
-    if hour < 12:
-        slot_label = "Morning Report"
-    elif hour < 16:
-        slot_label = "Afternoon Report"
-    else:
-        slot_label = "Evening Report"
+    slot_label = "Morning Report"
 
-    # ── Location-wise summary table rows ─────────────────────────────────
-    location_rows_html = ""
-    for idx, loc in enumerate(location_stats, start=1):
-        bg = "#f7faff" if idx % 2 == 0 else "#ffffff"
-        online_color  = "#1e8a2e" if loc["online"]  > 0 else "#999"
-        offline_color = "#cc0000" if loc["offline"] > 0 else "#999"
-        location_rows_html += f"""
-        <tr style="background:{bg};">
-            <td style="padding:9px 14px; border:1px solid #e0e6f0; text-align:center;">{idx}</td>
-            <td style="padding:9px 14px; border:1px solid #e0e6f0;">{loc['location_name']}</td>
-            <td style="padding:9px 14px; border:1px solid #e0e6f0; text-align:center;">
-                <strong>{loc['total']}</strong>
-            </td>
-            <td style="padding:9px 14px; border:1px solid #e0e6f0; text-align:center;
-                       color:{online_color}; font-weight:bold;">
-                🟢 {loc['online']}
-            </td>
-            <td style="padding:9px 14px; border:1px solid #e0e6f0; text-align:center;
-                       color:{offline_color}; font-weight:bold;">
-                🔴 {loc['offline']}
-            </td>
-        </tr>"""
+    # ── Location-wise breakdown: each location + its offline machines ─────
+    location_blocks_html = ""
 
-    # Grand total footer row
-    location_rows_html += f"""
-        <tr style="background:#1a3c78; color:#fff;">
-            <td style="padding:10px 14px; border:1px solid #2c5f9e;" colspan="2">
-                <strong>Grand Total</strong>
-            </td>
-            <td style="padding:10px 14px; border:1px solid #2c5f9e; text-align:center;">
-                <strong>{total}</strong>
-            </td>
-            <td style="padding:10px 14px; border:1px solid #2c5f9e; text-align:center;">
-                <strong>🟢 {total_online}</strong>
-            </td>
-            <td style="padding:10px 14px; border:1px solid #2c5f9e; text-align:center;">
-                <strong>🔴 {total_offline}</strong>
-            </td>
-        </tr>"""
-
-    # ── Disconnected machines detail table ───────────────────────────────
-    if disconnected:
-        disconnected_rows_html = ""
-        for idx, m in enumerate(disconnected, start=1):
-            bg = "#fff5f5" if idx % 2 == 0 else "#ffffff"
-            disconnected_rows_html += f"""
-            <tr style="background:{bg};">
-                <td style="padding:9px 14px; border:1px solid #f0d0d0; text-align:center;">{idx}</td>
-                <td style="padding:9px 14px; border:1px solid #f0d0d0; text-align:center;">
-                    {m['machine_id']}
-                </td>
-                <td style="padding:9px 14px; border:1px solid #f0d0d0;">
-                    <strong>{m['machine_name']}</strong>
-                </td>
-                <td style="padding:9px 14px; border:1px solid #f0d0d0;">
-                    {m['location_name']}
-                </td>
-                <td style="padding:9px 14px; border:1px solid #f0d0d0; text-align:center;">
-                    {m['location_id']}
-                </td>
-                <td style="padding:9px 14px; border:1px solid #f0d0d0; color:#888; font-size:12px;">
-                    {m['last_log_time']}
+    if location_stats:
+        for loc_idx, loc in enumerate(location_stats):
+            # Location header row
+            location_blocks_html += f"""
+            <tr style="background:#1a3c78;">
+                <td colspan="3"
+                    style="padding:10px 14px; border:1px solid #2c5f9e;
+                           color:#fff; font-weight:bold; font-size:13px;">
+                    📍 {loc['location_name']}
+                    <span style="font-weight:normal; font-size:12px; color:#a8c4f0;">
+                        &nbsp;—&nbsp; {loc['offline_count']} machine(s) offline
+                    </span>
                 </td>
             </tr>"""
 
-        disconnected_section = f"""
+            # One row per offline machine under this location
+            for m_idx, m in enumerate(loc["machines"]):
+                bg = "#fff5f5" if m_idx % 2 == 0 else "#ffffff"
+                message_cell = (
+                    f'<span style="color:#666; font-size:11px;">{m["message_string"]}</span>'
+                    if m["message_string"]
+                    else '<span style="color:#bbb; font-size:11px;">—</span>'
+                )
+                location_blocks_html += f"""
+                <tr style="background:{bg};">
+                    <td style="padding:9px 14px; border:1px solid #f0d0d0;
+                               text-align:center; color:#888; font-size:12px;">
+                        {m['machine_id']}
+                    </td>
+                    <td style="padding:9px 14px; border:1px solid #f0d0d0; font-weight:bold;">
+                        🔴 {m['machine_name']}
+                        <div style="font-size:11px; color:#888; font-weight:normal;">
+                            {m['category_name']} &nbsp;|&nbsp; v{m['build_version']}
+                        </div>
+                    </td>
+                    <td style="padding:9px 14px; border:1px solid #f0d0d0;">
+                        {message_cell}
+                    </td>
+                </tr>"""
+
+        # Spacer between location groups
+        location_blocks_html += """
+            <tr>
+                <td colspan="3"
+                    style="padding:4px; background:#f0f4f8; border:none;">
+                </td>
+            </tr>"""
+
+    else:
+        location_blocks_html = """
+            <tr>
+                <td colspan="3"
+                    style="padding:16px; text-align:center; color:#1e8a2e;
+                           font-weight:bold;">
+                    ✅ All machines are online!
+                </td>
+            </tr>"""
+
+    # ── Offline section (location + machine table) ────────────────────────
+    if disconnected:
+        offline_section = f"""
         <h3 style="color:#cc0000; margin-top:32px; font-family:Arial,sans-serif;">
-            🔴 Disconnected Machines — {total_offline} machine(s) offline
+            🔴 Location-wise Offline Breakdown — {total_offline} machine(s) offline
         </h3>
-        <table style="border-collapse:collapse; width:100%; max-width:750px; font-family:Arial,sans-serif; font-size:13px;">
+        <table style="border-collapse:collapse; width:100%; max-width:780px;
+                      font-family:Arial,sans-serif; font-size:13px;">
             <thead>
                 <tr style="background:#cc0000; color:#fff;">
-                    <th style="padding:10px 14px; border:1px solid #f0d0d0;">#</th>
-                    <th style="padding:10px 14px; border:1px solid #f0d0d0;">Machine ID</th>
-                    <th style="padding:10px 14px; border:1px solid #f0d0d0;">Machine Name</th>
-                    <th style="padding:10px 14px; border:1px solid #f0d0d0;">Location Name</th>
-                    <th style="padding:10px 14px; border:1px solid #f0d0d0;">Location ID</th>
-                    <th style="padding:10px 14px; border:1px solid #f0d0d0;">Last Log Time</th>
+                    <th style="padding:10px 14px; border:1px solid #f0d0d0; width:80px;">
+                        Machine ID
+                    </th>
+                    <th style="padding:10px 14px; border:1px solid #f0d0d0; text-align:left;">
+                        Machine Name
+                    </th>
+                    <th style="padding:10px 14px; border:1px solid #f0d0d0; text-align:left;">
+                        Last Message
+                    </th>
                 </tr>
             </thead>
             <tbody>
-                {disconnected_rows_html}
+                {location_blocks_html}
             </tbody>
         </table>"""
     else:
-        disconnected_section = """
+        offline_section = """
         <div style="margin-top:28px; padding:16px 24px; background:#e6f4ea;
                     border-left:5px solid #1e8a2e; border-radius:4px;
                     font-family:Arial,sans-serif;">
@@ -453,35 +435,14 @@ def build_machine_status_email():
                 </tr>
             </table>
 
-            <!-- Location-wise breakdown -->
-            <h3 style="margin-top:28px; margin-bottom:10px; color:#1a3c78;">
-                📍 Location-wise Breakdown
-            </h3>
-            <table style="border-collapse:collapse; width:100%; max-width:650px; font-size:13px;">
-                <thead>
-                    <tr style="background:#2c5f9e; color:#fff;">
-                        <th style="padding:10px 14px; border:1px solid #4a7bbf;">#</th>
-                        <th style="padding:10px 14px; border:1px solid #4a7bbf; text-align:left;">
-                            Location Name
-                        </th>
-                        <th style="padding:10px 14px; border:1px solid #4a7bbf;">Total</th>
-                        <th style="padding:10px 14px; border:1px solid #4a7bbf;">Online</th>
-                        <th style="padding:10px 14px; border:1px solid #4a7bbf;">Offline</th>
-                    </tr>
-                </thead>
-                <tbody>
-                    {location_rows_html}
-                </tbody>
-            </table>
-
-            <!-- Disconnected machines detail -->
-            {disconnected_section}
+            <!-- Location-wise offline breakdown -->
+            {offline_section}
 
             <!-- Footer -->
-            <p style="margin-top:36px; color:#bbb; font-size:11px; border-top:1px solid #eee;
-                      padding-top:12px;">
+            <p style="margin-top:36px; color:#bbb; font-size:11px;
+                      border-top:1px solid #eee; padding-top:12px;">
                 Generated at {gen_str} &nbsp;|&nbsp; Consumer2 Machine Monitor
-                &nbsp;|&nbsp; Report Schedule: 10:00 AM · 1:30 PM · 7:00 PM
+                &nbsp;|&nbsp; Report Schedule: 10:00 AM Daily
             </p>
 
         </div>
@@ -529,13 +490,13 @@ def send_html_email(subject, html_body):
 
 
 # ════════════════════════════════════════════════════════════════════════════
-#  SCHEDULED REPORT  (10:00 AM · 1:30 PM · 7:00 PM)
+#  SCHEDULED REPORT  (10:00 AM daily)
 # ════════════════════════════════════════════════════════════════════════════
 
 def schedule_machine_report():
     """
-    Background thread — fires machine status email at:
-        10:00 AM, 1:30 PM, 7:00 PM every day.
+    Background thread — fires machine status email at 10:00 AM every day.
+    Wrapped in try/except so a single failure never kills the thread.
     """
     logger.info(
         f"Machine report scheduler started. "
@@ -543,43 +504,47 @@ def schedule_machine_report():
     )
 
     while True:
-        now = datetime.now()
+        try:
+            now = datetime.now()
 
-        # Build today's scheduled datetime objects
-        todays_slots = []
-        for t in REPORT_TIMES:
-            hour, minute = map(int, t.split(":"))
-            slot = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
-            todays_slots.append(slot)
+            # Build today's scheduled datetime objects
+            todays_slots = []
+            for t in REPORT_TIMES:
+                hour, minute = map(int, t.split(":"))
+                slot = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+                todays_slots.append(slot)
 
-        # Find the next upcoming slot
-        future_slots = [s for s in todays_slots if s > now]
+            # Find the next upcoming slot
+            future_slots = [s for s in todays_slots if s > now]
 
-        if future_slots:
-            next_run = min(future_slots)
-        else:
-            # All done for today → schedule first slot tomorrow
-            hour, minute = map(int, REPORT_TIMES[0].split(":"))
-            next_run = (now + timedelta(days=1)).replace(
-                hour=hour, minute=minute, second=0, microsecond=0
+            if future_slots:
+                next_run = min(future_slots)
+            else:
+                # All done for today → schedule first slot tomorrow
+                hour, minute = map(int, REPORT_TIMES[0].split(":"))
+                next_run = (now + timedelta(days=1)).replace(
+                    hour=hour, minute=minute, second=0, microsecond=0
+                )
+
+            wait_seconds = (next_run - now).total_seconds()
+            logger.info(
+                f"Next machine report at {next_run.strftime('%d-%m-%Y %H:%M')} "
+                f"({wait_seconds / 3600:.2f} hrs away)"
             )
 
-        wait_seconds = (next_run - now).total_seconds()
-        logger.info(
-            f"Next machine report at {next_run.strftime('%d-%m-%Y %H:%M')} "
-            f"({wait_seconds / 3600:.2f} hrs away)"
-        )
+            time.sleep(wait_seconds)
 
-        time.sleep(wait_seconds)
-
-        try:
             now_label = datetime.now().strftime("%d %b %Y %H:%M")
             subject   = f"Machine Status Report — {now_label}"
             body      = build_machine_status_email()
             send_html_email(subject, body)
             logger.info(f"Machine status report sent at {now_label}")
+
         except Exception as e:
-            logger.error(f"Machine report send failed: {e}")
+            logger.error(
+                f"[schedule_machine_report] Error — will retry next cycle: {e}",
+                exc_info=True
+            )
 
         # Small buffer so we don't re-trigger the same slot
         time.sleep(65)
@@ -649,10 +614,10 @@ def monitor_producer_heartbeat():
     )
 
     for message in consumer:
-        hb            = message.value
-        producer_id   = hb['producer_id']
-        producer_name = hb['producer_name']
-        location_id   = hb['location_id']
+        hb             = message.value
+        producer_id    = hb['producer_id']
+        producer_name  = hb['producer_name']
+        location_id    = hb['location_id']
         last_heartbeat = datetime.fromisoformat(hb['timestamp'])
 
         logger.info(f"Received heartbeat: {hb}")
@@ -687,14 +652,7 @@ def handle_shutdown(signum, frame):
 # ════════════════════════════════════════════════════════════════════════════
 
 def consume_messages():
-    conn = pyodbc.connect(
-        f"DRIVER={DB_DRIVER13};"
-        f"SERVER={DB_SERVER};"
-        f"DATABASE={DB_NAME};"
-        f"UID={DB_USER};"
-        f"PWD={DB_PASSWORD};"
-    )
-    cursor = conn.cursor()
+    DB_RETRY_WAIT = 10   # seconds to wait before reconnecting after a DB failure
 
     consumer = KafkaConsumer(
         "dbo.LogException",
@@ -715,25 +673,70 @@ def consume_messages():
     logger.info("Consumer2 initialized. Starting message processing...")
 
     while True:
-        batch = consumer.poll(timeout_ms=5000, max_records=200)
-        if not batch:
-            continue
-
-        messages = [msg for tp, msgs in batch.items() for msg in msgs]
-
+        # ── Establish (or re-establish) DB connection ─────────────────────
+        conn   = None
+        cursor = None
         try:
-            for message in messages:
-                success = process_message(cursor, message)
-                if not success:
-                    raise Exception(f"Failed to process message: {message.value}")
+            conn   = get_db_connection()
+            cursor = conn.cursor()
+            logger.info("Database connection established.")
+        except pyodbc.Error as e:
+            logger.error(f"Failed to connect to database: {e}. Retrying in {DB_RETRY_WAIT}s...")
+            time.sleep(DB_RETRY_WAIT)
+            continue   # restart the outer while loop to retry connection
 
-            conn.commit()
-            consumer.commit()
-            logger.info(f"Processed {len(messages)} messages successfully")
+        # ── Message poll loop (runs until a DB error forces a reconnect) ──
+        try:
+            while True:
+                batch = consumer.poll(timeout_ms=5000, max_records=200)
+                if not batch:
+                    continue
+
+                messages = [msg for tp, msgs in batch.items() for msg in msgs]
+
+                try:
+                    for message in messages:
+                        success = process_message(cursor, message)
+                        if not success:
+                            raise Exception(f"Failed to process message: {message.value}")
+
+                    conn.commit()
+                    consumer.commit()
+                    logger.info(f"Processed {len(messages)} messages successfully")
+
+                except pyodbc.Error as e:
+                    # DB-level error: rollback and break out to reconnect
+                    logger.error(f"DB error during batch processing: {e}. Reconnecting...")
+                    try:
+                        conn.rollback()
+                    except Exception:
+                        pass
+                    break   # exit inner while → outer while will reconnect
+
+                except Exception as e:
+                    # Non-DB processing error: rollback and keep going
+                    logger.error(f"Processing error during batch: {e}")
+                    try:
+                        conn.rollback()
+                    except Exception:
+                        pass
 
         except Exception as e:
-            logger.error(f"Error during processing: {e}")
-            conn.rollback()
+            logger.error(f"Unexpected error in message loop: {e}. Reconnecting in {DB_RETRY_WAIT}s...")
+            time.sleep(DB_RETRY_WAIT)
+
+        finally:
+            # Always clean up the current connection before the outer loop retries
+            if cursor:
+                try:
+                    cursor.close()
+                except Exception:
+                    pass
+            if conn:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
 
 
 def process_message(cursor, message):
@@ -1004,7 +1007,7 @@ if __name__ == "__main__":
         daemon=True
     ).start()
 
-    # Machine status report — 10:00 AM, 1:30 PM, 7:00 PM
+    # Machine status report — 10:00 AM daily
     threading.Thread(
         target=schedule_machine_report,
         name="MachineReportScheduler",
