@@ -3,6 +3,8 @@ import json
 import time
 import signal
 import logging
+import random
+import threading
 from datetime import datetime
 
 import pyodbc
@@ -33,56 +35,48 @@ KAFKA_SERVERS = os.getenv("KAFKA_BOOTSTRAP_SERVERS")
 GROUP_ID      = os.getenv("TP_CONSUMER_GROUP", "test_parameter_group")
 TABLE_NAME    = "dbo.Test_Parameters"
 BATCH_SIZE    = 500
-MAX_RETRIES   = 3
+
+DEADLOCK_RETRIES        = 3
+DLQ_RETRY_SLEEP_BASE_MS = 2000
+
+DLQ_TABLE        = "dbo.Test_Parameters_DLQ"
+DLQ_RETRY_AFTER  = int(os.getenv("DLQ_RETRY_AFTER_SECS", "600"))
+DLQ_MAX_ATTEMPTS = int(os.getenv("DLQ_MAX_ATTEMPTS", "5"))
 
 columns = [
-    'ResultID','OrderID','PatientMasterID','MacDataGuid','ParameterCode','TestCode',
-    'Result','ResultType','DbStatus','CreatedDate','ResultReceivedDate','ResultUpdateDate',
-    'ModifiedDate','MachineFID','LocationID','IsSync','InstrumentId'
+    'ResultID', 'OrderID', 'PatientMasterID', 'MacDataGuid', 'ParameterCode', 'TestCode',
+    'Result', 'ResultType', 'DbStatus', 'CreatedDate', 'ResultReceivedDate', 'ResultUpdateDate',
+    'ModifiedDate', 'MachineFID', 'LocationID', 'IsSync', 'InstrumentId'
 ]
 
 # -----------------------------
-# JSON LOGGER
+# LOGGING
 # -----------------------------
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 LOG_DIR  = os.path.join(BASE_DIR, "logs_tp")
 os.makedirs(LOG_DIR, exist_ok=True)
 
+LOG_FORMAT         = "%(asctime)s | %(levelname)s | %(process)d | %(message)s"
 INSTANCE_NAME      = os.getenv("TP_INSTANCE_NAME", f"tp_consumer_{os.getpid()}")
 LOG_RETENTION_DAYS = int(os.getenv("LOG_RETENTION_DAYS", "3"))
-
-class JsonFormatter(logging.Formatter):
-    def format(self, record):
-        base = {
-            "ts":       self.formatTime(record, "%Y-%m-%dT%H:%M:%S"),
-            "level":    record.levelname,
-            "pid":      record.process,
-            "instance": INSTANCE_NAME,
-            "msg":      record.getMessage(),
-        }
-        for key, val in record.__dict__.items():
-            if key.startswith("x_"):
-                base[key[2:]] = val
-        if record.exc_info:
-            base["exc"] = self.formatException(record.exc_info)
-        return json.dumps(base, default=str)
 
 logger = logging.getLogger(INSTANCE_NAME)
 logger.setLevel(logging.INFO)
 logger.handlers.clear()
 
 file_handler = TimedRotatingFileHandler(
-    filename=os.path.join(LOG_DIR, f"{INSTANCE_NAME}.jsonl"),
-    when="H", interval=1,
+    filename=os.path.join(LOG_DIR, f"{INSTANCE_NAME}.log"),
+    when="H",
+    interval=1,
     backupCount=24 * LOG_RETENTION_DAYS,
     encoding="utf-8"
 )
-file_handler.suffix = "%Y-%m-%d_%H.jsonl"
-file_handler.setFormatter(JsonFormatter())
+file_handler.suffix = "%Y-%m-%d_%H.log"
+file_handler.setFormatter(logging.Formatter(LOG_FORMAT))
 file_handler.setLevel(logging.INFO)
 
 console = logging.StreamHandler()
-console.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(process)d | %(message)s"))
+console.setFormatter(logging.Formatter(LOG_FORMAT))
 console.setLevel(logging.INFO)
 
 logger.addHandler(file_handler)
@@ -90,18 +84,11 @@ logger.addHandler(console)
 logger.propagate = False
 
 # -----------------------------
-# STRUCTURED LOG HELPER
-# -----------------------------
-def log(level, msg, **fields):
-    extra = {f"x_{k}": v for k, v in fields.items()}
-    getattr(logger, level)(msg, extra=extra)
-
-# -----------------------------
 # SIGNAL HANDLING
 # -----------------------------
 def shutdown(signum, frame):
     global running
-    log("info", "Shutdown signal received", signal=signum)
+    logger.info("Shutdown signal received...")
     running = False
 
 signal.signal(signal.SIGINT,  shutdown)
@@ -115,7 +102,7 @@ def parse_dates(record):
         if key in record and isinstance(record[key], str):
             try:
                 record[key] = datetime.fromisoformat(record[key])
-            except:
+            except Exception:
                 record[key] = None
     return record
 
@@ -129,52 +116,410 @@ def get_connection():
         f"DATABASE={os.getenv('DB_NAME')};"
         f"UID={os.getenv('DB_USER')};"
         f"PWD={os.getenv('DB_PASSWORD')};"
-        "Encrypt=yes;TrustServerCertificate=yes;",
+        "Encrypt=yes;"
+        "TrustServerCertificate=yes;",
         autocommit=False
     )
 
-def get_connection_with_retry(max_wait=300):
-    retry = 0
-    while running:
-        try:
-            conn = get_connection()
-            log("info", "✅ DB connected", attempt=retry + 1)
-            return conn
-        except pyodbc.OperationalError as e:
-            delay = min(10 * (2 ** retry), max_wait)
-            retry += 1
-            log("error", "❌ DB down — retrying",
-                error=str(e),
-                attempt=retry,
-                next_retry_sec=delay
-            )
-            time.sleep(delay)
+def is_deadlock(exc):
+    return "40001" in str(exc)
 
-def ensure_connection(conn):
+def is_doomed(exc):
+    return "3930" in str(exc)
+
+def safe_rollback(conn):
     try:
-        conn.cursor().execute("SELECT 1")
-        return conn
+        conn.rollback()
+        return True
+    except Exception as rb_exc:
+        if is_doomed(rb_exc):
+            logger.error("☠️  Transaction doomed (3930) — connection must be replaced")
+            return False
+        logger.error(f"Rollback failed unexpectedly: {rb_exc}")
+        return False
+
+def replace_connection(conn, cursor):
+    try:
+        cursor.close()
     except Exception:
-        log("warning", "⚠️ DB connection lost — reconnecting...")
-        try:
-            conn.close()
-        except:
-            pass
-        return get_connection_with_retry()
+        pass
+    try:
+        conn.close()
+    except Exception:
+        pass
+    logger.info("🔄 Replacing DB connection...")
+    new_conn   = get_connection()
+    new_cursor = new_conn.cursor()
+    logger.info("✅ DB connection replaced")
+    return new_conn, new_cursor
+
 
 # -----------------------------
-# BATCH UPSERT
+# DEAD LETTER QUEUE
+# -----------------------------
+
+def ensure_dlq_table(cursor, conn):
+    cursor.execute(f"""
+    IF NOT EXISTS (
+        SELECT 1 FROM sys.objects
+        WHERE object_id = OBJECT_ID(N'{DLQ_TABLE}') AND type = 'U'
+    )
+    CREATE TABLE {DLQ_TABLE} (
+        DLQId           BIGINT IDENTITY(1,1) PRIMARY KEY,
+        ResultID        BIGINT,
+        LocationID      INT,
+        Payload         NVARCHAR(MAX),
+        ErrorReason     NVARCHAR(500),
+        Attempts        INT       DEFAULT 1,
+        Failed          BIT       DEFAULT 0,
+        CreatedAt       DATETIME2 DEFAULT GETDATE(),
+        LastAttemptAt   DATETIME2 DEFAULT GETDATE(),
+        ResolvedAt      DATETIME2 NULL
+    )
+    """)
+    conn.commit()
+
+
+def write_to_dead_letter(cursor, conn, record, error):
+    try:
+        payload   = json.dumps(record, default=str)
+        error_str = str(error)[:500]
+
+        cursor.execute(f"""
+            IF EXISTS (
+                SELECT 1 FROM {DLQ_TABLE}
+                WHERE ResultID = ? AND LocationID = ? AND Failed = 0
+            )
+                UPDATE {DLQ_TABLE}
+                SET    Attempts      = Attempts + 1,
+                       ErrorReason   = ?,
+                       LastAttemptAt = GETDATE()
+                WHERE  ResultID = ? AND LocationID = ? AND Failed = 0
+            ELSE
+                INSERT INTO {DLQ_TABLE} (ResultID, LocationID, Payload, ErrorReason)
+                VALUES (?, ?, ?, ?)
+        """,
+            record.get("ResultID"), record.get("LocationID"),
+            error_str,
+            record.get("ResultID"), record.get("LocationID"),
+            record.get("ResultID"), record.get("LocationID"),
+            payload, error_str
+        )
+        conn.commit()
+        logger.warning(
+            f"📥 DLQ | ResultID={record.get('ResultID')} "
+            f"| LocationID={record.get('LocationID')} "
+            f"| reason={error_str[:120]}"
+        )
+    except Exception as dlq_exc:
+        logger.error(f"❌ DLQ write failed: {dlq_exc} — falling back to local file")
+        _write_dlq_to_file(record, error)
+
+
+def _write_dlq_to_file(record, error):
+    try:
+        dlq_file = os.path.join(LOG_DIR, f"{INSTANCE_NAME}_dlq.jsonl")
+        entry = {
+            "ts":     datetime.utcnow().isoformat(),
+            "error":  str(error)[:500],
+            "record": {k: str(v) for k, v in record.items()}
+        }
+        with open(dlq_file, "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry) + "\n")
+        logger.warning(f"📄 DLQ fallback file: {dlq_file}")
+    except Exception as fe:
+        logger.critical(f"💀 TOTAL DLQ FAILURE — record lost: {record} | {fe}")
+
+
+# -----------------------------
+# DLQ REPROCESS WORKER
+# Runs in its own background thread with its own dedicated DB connection.
+# Completely isolated from the main poll loop — no lock contention.
+# -----------------------------
+
+def _dlq_reprocess_worker():
+    logger.info("🔁 DLQ reprocess thread started")
+
+    while running:
+        for _ in range(DLQ_RETRY_AFTER):
+            if not running:
+                break
+            time.sleep(1)
+
+        if not running:
+            break
+
+        try:
+            dlq_conn   = get_connection()
+            dlq_cursor = dlq_conn.cursor()
+        except Exception as e:
+            logger.error(f"DLQ thread: failed to open DB connection: {e}")
+            continue
+
+        try:
+            _run_dlq_pass(dlq_conn, dlq_cursor)
+        except Exception as e:
+            logger.error(f"DLQ thread: unhandled error in reprocess pass: {e}")
+        finally:
+            try:
+                dlq_cursor.close()
+            except Exception:
+                pass
+            try:
+                dlq_conn.close()
+            except Exception:
+                pass
+
+    logger.info("🔁 DLQ reprocess thread stopped")
+
+
+def _run_dlq_pass(dlq_conn, dlq_cursor):
+    try:
+        dlq_cursor.execute(f"""
+            SELECT DLQId, Payload, Attempts
+            FROM   {DLQ_TABLE}
+            WHERE  Failed        = 0
+            AND    Attempts      < ?
+            AND    LastAttemptAt < DATEADD(SECOND, -{DLQ_RETRY_AFTER}, GETDATE())
+        """, DLQ_MAX_ATTEMPTS)
+        rows = dlq_cursor.fetchall()
+    except Exception as e:
+        logger.error(f"DLQ fetch failed: {e}")
+        return
+
+    if not rows:
+        return
+
+    logger.info(f"🔁 DLQ reprocess pass | {len(rows)} record(s) pending")
+
+    for dlq_id, payload_json, attempts in rows:
+        if not running:
+            break
+
+        try:
+            record = json.loads(payload_json)
+        except Exception:
+            logger.error(f"DLQ row {dlq_id} unparseable — marking failed")
+            _mark_dlq_failed(dlq_cursor, dlq_conn, dlq_id, "Unparseable payload")
+            continue
+
+        ok = _dlq_safe_process_one(dlq_conn, dlq_cursor, record)
+
+        if ok:
+            try:
+                dlq_cursor.execute(f"""
+                    UPDATE {DLQ_TABLE}
+                    SET Failed=0, ResolvedAt=GETDATE()
+                    WHERE DLQId=?
+                """, dlq_id)
+                dlq_conn.commit()
+                logger.info(
+                    f"✅ DLQ resolved | ResultID={record.get('ResultID')} "
+                    f"| LocationID={record.get('LocationID')} "
+                    f"| after {attempts + 1} total attempt(s)"
+                )
+            except Exception as e:
+                logger.error(f"DLQ resolve update failed for DLQId={dlq_id}: {e}")
+        else:
+            new_attempts = attempts + 1
+            if new_attempts >= DLQ_MAX_ATTEMPTS:
+                _mark_dlq_failed(
+                    dlq_cursor, dlq_conn, dlq_id,
+                    f"Exhausted {DLQ_MAX_ATTEMPTS} attempts"
+                )
+
+
+def _dlq_safe_process_one(conn, cursor, record):
+    last_exc = None
+
+    for attempt in range(1, DEADLOCK_RETRIES + 1):
+        try:
+            process_batch(cursor, [record])
+            conn.commit()
+            logger.info(
+                f"✅ DLQ batch committed | "
+                f"ResultID={record.get('ResultID')} | attempt={attempt}"
+            )
+            return True
+
+        except Exception as e:
+            last_exc = e
+
+            if is_doomed(e):
+                logger.error(
+                    f"☠️  DLQ doomed transaction (3930) | "
+                    f"ResultID={record.get('ResultID')} | attempt={attempt} "
+                    f"— replacing connection"
+                )
+                safe_rollback(conn)
+                conn, cursor = replace_connection(conn, cursor)
+                if attempt < DEADLOCK_RETRIES:
+                    continue
+                break
+
+            if is_deadlock(e):
+                safe_rollback(conn)
+                if attempt < DEADLOCK_RETRIES:
+                    sleep_ms = (DLQ_RETRY_SLEEP_BASE_MS * attempt) + random.randint(0, 500)
+                    logger.warning(
+                        f"⚠️ DLQ deadlock attempt {attempt}/{DEADLOCK_RETRIES} "
+                        f"| ResultID={record.get('ResultID')} "
+                        f"| retrying in {sleep_ms}ms"
+                    )
+                    time.sleep(sleep_ms / 1000.0)
+                    continue
+                break
+
+            safe_rollback(conn)
+            break
+
+    logger.error(
+        f"❌ DLQ record still failing after {DEADLOCK_RETRIES} attempts "
+        f"| ResultID={record.get('ResultID')} | error={last_exc}"
+    )
+    return False
+
+
+def _mark_dlq_failed(cursor, conn, dlq_id, reason):
+    try:
+        cursor.execute(f"""
+            UPDATE {DLQ_TABLE}
+            SET Failed=1, ErrorReason=?, LastAttemptAt=GETDATE()
+            WHERE DLQId=?
+        """, reason[:500], dlq_id)
+        conn.commit()
+        logger.error(
+            f"🚨 DLQ PERMANENTLY FAILED | DLQId={dlq_id} | reason={reason} "
+            f"— manual intervention required"
+        )
+    except Exception as e:
+        logger.error(f"Could not mark DLQ row {dlq_id} as failed: {e}")
+
+
+# -----------------------------
+# safe_process_batch
+#
+# Three-layer defence against deadlocks:
+#   1. Deduplicate — per (ResultID, LocationID) keep latest ModifiedDate.
+#   2. Sort by (LocationID, ResultID) — deterministic lock order.
+#   3. Retry up to DEADLOCK_RETRIES times with jitter on deadlock (40001).
+#   4. Binary split fallback — size=1 failures go to DLQ.
+# -----------------------------
+def safe_process_batch(conn, cursor, records):
+
+    # Deduplicate within batch — per (ResultID, LocationID)
+    # keep the record with the latest ModifiedDate
+    deduped = {}
+    for r in records:
+        key = (r.get("ResultID"), r.get("LocationID"))
+        if key not in deduped:
+            deduped[key] = r
+        else:
+            r_mod  = r.get("ModifiedDate") or ""
+            ex_mod = deduped[key].get("ModifiedDate") or ""
+            if r_mod > ex_mod:
+                deduped[key] = r
+
+    dupes = len(records) - len(deduped)
+    if dupes > 0:
+        logger.warning(
+            f"⚠️ Deduplicated {dupes} duplicate(s) "
+            f"| original={len(records)} | unique={len(deduped)}"
+        )
+
+    # Sort for deterministic lock ordering — reduces deadlocks
+    sorted_records = sorted(
+        deduped.values(),
+        key=lambda r: (r.get("LocationID") or 0, r.get("ResultID") or 0)
+    )
+
+    pending = [sorted_records]
+    all_ok  = True
+
+    while pending:
+        batch    = pending.pop()
+        last_exc = None
+
+        for attempt in range(1, DEADLOCK_RETRIES + 1):
+            try:
+                process_batch(cursor, batch)
+                conn.commit()
+                logger.info(f"✅ Batch committed | size={len(batch)} | attempt={attempt}")
+                last_exc = None
+                break
+
+            except Exception as e:
+                last_exc = e
+
+                if is_doomed(e):
+                    logger.error(
+                        f"☠️  Doomed transaction (3930) | size={len(batch)} "
+                        f"| attempt={attempt} — replacing connection"
+                    )
+                    safe_rollback(conn)
+                    conn, cursor = replace_connection(conn, cursor)
+                    if attempt < DEADLOCK_RETRIES:
+                        continue
+                    break
+
+                if is_deadlock(e):
+                    safe_rollback(conn)
+                    if attempt < DEADLOCK_RETRIES:
+                        sleep_ms = (50 * attempt) + random.randint(0, 50)
+                        logger.warning(
+                            f"⚠️ Deadlock attempt {attempt}/{DEADLOCK_RETRIES} "
+                            f"| size={len(batch)} | retrying in {sleep_ms}ms"
+                        )
+                        time.sleep(sleep_ms / 1000.0)
+                        continue
+                    break
+
+                safe_rollback(conn)
+                break
+
+        if last_exc is None:
+            continue
+
+        logger.error(
+            f"❌ BATCH FAILED after {DEADLOCK_RETRIES} attempts "
+            f"| size={len(batch)} | error={last_exc}"
+        )
+
+        if len(batch) == 1:
+            write_to_dead_letter(cursor, conn, batch[0], last_exc)
+            all_ok = False
+            continue
+
+        mid = len(batch) // 2
+        pending.append(batch[mid:])
+        pending.append(batch[:mid])
+
+    return conn, cursor, all_ok
+
+
+# -----------------------------
+# process_batch
+#
+# MERGE RULES:
+#   WHEN MATCHED AND source.DbStatus = 5
+#       → UPDATE all columns — final state always wins
+#   WHEN NOT MATCHED
+#       → INSERT always regardless of DbStatus
+#
+# HOLDLOCK on MERGE — prevents phantom row deadlocks
+# Same as SERIALIZABLE — safe for concurrent writers
 # -----------------------------
 def process_batch(cursor, records):
-    merge_query = f"""
-    MERGE {TABLE_NAME} AS target
-    USING (VALUES ({",".join(["?"] * len(columns))})) AS source ({",".join(columns)})
-    ON target.ResultID = source.ResultID
-       AND target.LocationID = source.LocationID
 
-    WHEN MATCHED
+    merge_query = f"""
+    MERGE {TABLE_NAME} WITH (HOLDLOCK) AS target
+    USING (VALUES ({",".join(["?"] * len(columns))})) AS source ({",".join(columns)})
+    ON target.ResultID    = source.ResultID
+    AND target.LocationID = source.LocationID
+
+    WHEN MATCHED AND source.DbStatus = 5
     THEN UPDATE SET
-        {",".join([f"{col}=source.{col}" for col in columns if col not in ("ResultID", "LocationID")])}
+        {",".join([f"{col}=source.{col}" for col in columns if col not in ("ResultID","LocationID")])}
 
     WHEN NOT MATCHED
     THEN INSERT ({",".join(columns)})
@@ -182,6 +527,7 @@ def process_batch(cursor, records):
     """
 
     values = []
+
     for record in records:
         record     = parse_dates(record)
         raw_status = record.get("DbStatus")
@@ -192,122 +538,53 @@ def process_batch(cursor, records):
             db_status = None
 
         record["DbStatus"] = db_status
+
+        if db_status is None:
+            logger.error(
+                f"⚠️ DbStatus is None | ResultID={record.get('ResultID')} "
+                f"| LocationID={record.get('LocationID')} "
+                f"| raw={raw_status!r} — skipping record"
+            )
+            continue
+
+        logger.info(
+            f"ResultID={record.get('ResultID')} | "
+            f"LocationID={record.get('LocationID')} | "
+            f"DbStatus={db_status}"
+        )
+
         values.append([record.get(col) for col in columns])
 
     if not values:
-        log("info", "No valid records in batch")
+        logger.info("No valid records to process in this batch")
         return
 
     cursor.fast_executemany = True
     cursor.executemany(merge_query, values)
+    logger.info(f"Batch sent to DB | valid_records={len(values)}")
 
-# -----------------------------
-# SAFE BATCH WITH DEADLOCK RETRY + DB RECONNECT
-# -----------------------------
-def safe_process_batch(cursor, conn, records, retry_count=0):
-    t_start = time.time()
-
-    try:
-        process_batch(cursor, records)
-        conn.commit()
-
-        elapsed = round(time.time() - t_start, 3)
-
-        status_counts = {}
-        for r in records:
-            s = str(r.get("DbStatus", "?"))
-            status_counts[s] = status_counts.get(s, 0) + 1
-
-        log("info", "✅ BATCH OK",
-            size=len(records),
-            elapsed_sec=elapsed,
-            status_counts=status_counts,
-            retry=retry_count,
-            result_ids=[r.get("ResultID") for r in records]
-        )
-        return True, conn
-
-    except Exception as e:
-        error_str   = str(e)
-        is_deadlock = '40001' in error_str
-        is_db_down  = any(code in error_str for code in [
-            '08001', '08S01', 'HYT00', 'IM002', '08003',
-            'Communication link failure',
-            'TCP Provider',
-            'named pipe',
-        ])
-
-        try:
-            conn.rollback()
-        except:
-            pass
-
-        # 🔴 DB DOWN → reconnect and retry same batch
-        if is_db_down:
-            log("error", "🔴 DB DOWN — waiting for recovery",
-                size=len(records),
-                error=error_str
-            )
-            conn   = get_connection_with_retry()
-            cursor = conn.cursor()
-            log("info", "🟢 DB recovered — retrying batch", size=len(records))
-            return safe_process_batch(cursor, conn, records, retry_count)
-
-        # ⚠️ DEADLOCK → retry with backoff
-        if is_deadlock and retry_count < MAX_RETRIES:
-            delay = 2 ** retry_count
-            log("warning", "⚠️ DEADLOCK — retrying",
-                size=len(records),
-                retry=f"{retry_count + 1}/{MAX_RETRIES}",
-                wait_sec=delay,
-                result_ids=[r.get("ResultID") for r in records]
-            )
-            time.sleep(delay)
-            return safe_process_batch(cursor, conn, records, retry_count + 1)
-
-        # ❌ Other error or retries exhausted
-        log("error", "❌ BATCH FAILED",
-            size=len(records),
-            error=error_str,
-            is_deadlock=is_deadlock,
-            retry=retry_count,
-            result_ids=[r.get("ResultID") for r in records]
-        )
-
-        # Single bad record → log full record and skip
-        if len(records) == 1:
-            log("error", "🚨 BAD RECORD — DROPPED",
-                result_id=records[0].get("ResultID"),
-                location_id=records[0].get("LocationID"),
-                db_status=records[0].get("DbStatus"),
-                record=records[0]
-            )
-            return False, conn
-
-        # Split batch into halves
-        mid   = len(records) // 2
-        left  = records[:mid]
-        right = records[mid:]
-
-        log("info", "🔀 Splitting batch",
-            original_size=len(records),
-            left=len(left),
-            right=len(right)
-        )
-
-        _, conn = safe_process_batch(cursor, conn, left)
-        _, conn = safe_process_batch(cursor, conn, right)
-        return False, conn
 
 # -----------------------------
 # CONSUMER
 # -----------------------------
 def consume():
-    conn   = get_connection_with_retry()
+    conn   = get_connection()
     cursor = conn.cursor()
 
+    ensure_dlq_table(cursor, conn)
+
+    # DLQ reprocess runs in its own background thread with its own
+    # dedicated DB connection — isolated from main poll loop entirely
+    dlq_thread = threading.Thread(
+        target=_dlq_reprocess_worker,
+        name="dlq-reprocess",
+        daemon=True
+    )
+    dlq_thread.start()
+    logger.info("🔁 DLQ reprocess thread launched")
+
     broker_list = [b.strip() for b in KAFKA_SERVERS.split(",") if b.strip()]
-    log("info", "🔌 Connecting to Kafka", brokers=broker_list)
+    logger.info(f"🔌 Connecting to Kafka brokers: {broker_list}")
 
     consumer = KafkaConsumer(
         TABLE_NAME,
@@ -316,43 +593,44 @@ def consume():
         enable_auto_commit=False,
         group_id=GROUP_ID,
 
-        # Performance
         max_poll_records=1000,
         fetch_max_bytes=52428800,
         fetch_max_wait_ms=500,
 
-        # Session
         session_timeout_ms=30000,
         heartbeat_interval_ms=10000,
         request_timeout_ms=40000,
 
-        auto_offset_reset="latest",
+        auto_offset_reset="earliest",
 
-        # Reconnect
         reconnect_backoff_ms=1000,
         reconnect_backoff_max_ms=30000,
     )
 
-    log("info", "🚀 TP Consumer started", group=GROUP_ID, brokers=broker_list)
+    logger.info(f"🚀 TP Consumer started | group={GROUP_ID} | brokers={broker_list}")
 
-    poll_cycle    = 0
-    total_written = 0
-    total_dropped = 0
+    DB_IDLE_CHECK_SECS = 300
+    last_write_time    = time.monotonic()
 
     while running:
         batch = consumer.poll(timeout_ms=5000)
 
         if not batch:
-            # Ping DB on every idle poll to detect outage early
-            conn   = ensure_connection(conn)
-            cursor = conn.cursor()
             continue
 
-        poll_cycle  += 1
-        all_records  = []
-        poll_total   = sum(len(msgs) for msgs in batch.values())
+        # DB idle heartbeat — reconnect if connection dropped
+        idle_secs = time.monotonic() - last_write_time
+        if idle_secs > DB_IDLE_CHECK_SECS:
+            try:
+                cursor.execute("SELECT 1")
+                logger.debug(f"DB heartbeat OK after {idle_secs:.0f}s idle")
+            except Exception:
+                logger.warning(
+                    f"DB connection lost after {idle_secs:.0f}s idle — reconnecting..."
+                )
+                conn, cursor = replace_connection(conn, cursor)
 
-        log("info", "📨 Poll received", cycle=poll_cycle, messages=poll_total)
+        all_records = []
 
         try:
             for _, messages in batch.items():
@@ -360,57 +638,35 @@ def consume():
                     all_records.append(msg.value)
 
                     if len(all_records) >= BATCH_SIZE:
-                        success, conn = safe_process_batch(cursor, conn, all_records)
-                        cursor = conn.cursor()
-                        if success:
-                            consumer.commit()
-                            total_written += len(all_records)
-                            log("info", "✅ Mid-batch committed",
-                                size=len(all_records),
-                                total_written=total_written)
-                        else:
-                            total_dropped += len(all_records)
-                            log("warning", "⚠️ Mid-batch partially failed",
-                                size=len(all_records),
-                                total_dropped=total_dropped)
+                        conn, cursor, _ = safe_process_batch(conn, cursor, all_records)
+                        consumer.commit()
+                        last_write_time = time.monotonic()
+                        logger.info(f"✅ Mid-batch committed: {len(all_records)}")
                         all_records.clear()
 
-            # Leftover records
             if all_records:
-                success, conn = safe_process_batch(cursor, conn, all_records)
-                cursor = conn.cursor()
-                if success:
-                    consumer.commit()
-                    total_written += len(all_records)
-                    log("info", "✅ Final batch committed",
-                        size=len(all_records),
-                        total_written=total_written)
-                else:
-                    total_dropped += len(all_records)
-                    log("warning", "⚠️ Final batch partially failed",
-                        size=len(all_records),
-                        total_dropped=total_dropped)
+                conn, cursor, _ = safe_process_batch(conn, cursor, all_records)
+                consumer.commit()
+                last_write_time = time.monotonic()
+                logger.info(f"✅ Final batch committed: {len(all_records)}")
                 all_records.clear()
 
         except Exception as e:
-            log("error", "❌ POLL LOOP ERROR", error=str(e))
-            try:
-                conn.rollback()
-            except:
-                pass
-            conn   = ensure_connection(conn)
-            cursor = conn.cursor()
+            logger.error(f"❌ POLL LOOP ERROR | {e}")
+            rollback_ok = safe_rollback(conn)
+            if not rollback_ok or is_doomed(e):
+                conn, cursor = replace_connection(conn, cursor)
 
     consumer.close()
     conn.close()
-    log("info", "🛑 Consumer shut down cleanly",
-        total_written=total_written,
-        total_dropped=total_dropped)
+    logger.info("🛑 Consumer shut down cleanly")
+
 
 # -----------------------------
 # MAIN WITH RETRY
 # -----------------------------
 if __name__ == "__main__":
+
     retry = 0
 
     while running:
@@ -421,24 +677,16 @@ if __name__ == "__main__":
         except (NoBrokersAvailable, CommitFailedError, pyodbc.OperationalError) as e:
             delay = min(10 * (2 ** retry), 300)
             retry += 1
-            log("error", "CONNECTION ERROR",
-                error=str(e),
-                retry=retry,
-                next_retry_sec=delay)
+            logger.error(f"CONNECTION ERROR | {e}")
 
         except KafkaError as e:
             delay = 15
-            log("error", "KAFKA ERROR",
-                error=str(e),
-                next_retry_sec=delay)
+            logger.error(f"KAFKA ERROR | {e}")
 
         except Exception as e:
             delay = 30
             retry += 1
-            log("error", "UNEXPECTED ERROR",
-                error=str(e),
-                retry=retry,
-                next_retry_sec=delay)
+            logger.error(f"UNEXPECTED ERROR | {e}")
 
         if running:
             time.sleep(delay)
