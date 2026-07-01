@@ -1,87 +1,50 @@
-import pyodbc
-import logging
-import time
-import smtplib
-import json
-import signal
 import os
-from dotenv import load_dotenv
-from kafka import KafkaConsumer
-from datetime import datetime
-from email.mime.text import MIMEText
-from kafka.errors import KafkaError, NoBrokersAvailable, CommitFailedError
+import json
+import time
+import signal
+import shutil
+import threading
+import logging
+from datetime import datetime, timedelta
 from logging.handlers import TimedRotatingFileHandler
 
+import pyodbc
+from dotenv import load_dotenv
+from kafka import KafkaConsumer, TopicPartition, OffsetAndMetadata
+from kafka.errors import KafkaError, NoBrokersAvailable, CommitFailedError
 
-# loading env variables
-load_dotenv()
-
-# # Configure logging
-# LOG_DIR = os.path.join(os.path.dirname(__file__), "logs")
-# os.makedirs(LOG_DIR, exist_ok=True)
-#
-# LOG_FORMAT = (
-#     "%(asctime)s | %(levelname)s | %(process)d | "
-#     "%(filename)s:%(lineno)d | %(message)s"
-# )
-#
-# formatter = logging.Formatter(LOG_FORMAT)
-#
-# # Main log (rotates daily)
-# file_handler = TimedRotatingFileHandler(
-#     filename=os.path.join(LOG_DIR, "consumer.log"),
-#     when="H",
-#     interval=12,
-#     backupCount=24,
-#     encoding="utf-8"
-# )
-# file_handler.setFormatter(formatter)
-# file_handler.setLevel(logging.INFO)
-#
-# # Error-only log
-# error_handler = TimedRotatingFileHandler(
-#     filename=os.path.join(LOG_DIR, "consumer_error.log"),
-#     when="H",
-#     interval=12,
-#     backupCount=24,
-#     encoding="utf-8"
-# )
-# error_handler.setFormatter(formatter)
-# error_handler.setLevel(logging.ERROR)
-#
-# # Console handler (ONLY for manual/debug runs)
-# console_handler = logging.StreamHandler()
-# console_handler.setFormatter(formatter)
-# console_handler.setLevel(logging.INFO)
-#
-# logger = logging.getLogger("KafkaConsumerService")
-# logger.setLevel(logging.INFO)
-#
-# # Prevent duplicate logs
-# logger.handlers.clear()
-#
-# logger.addHandler(file_handler)
-# logger.addHandler(error_handler)
-# logger.addHandler(console_handler)
-#
-# logger.propagate = False
+# -----------------------------
+# Global control flag
+# -----------------------------
+running = True
 
 # -----------------------------
 # Base paths
 # -----------------------------
-if getattr(sys, "frozen", False):
-    BASE_DIR = os.path.dirname(sys.executable)
-else:
-    BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))          # ...\kafkaConsumer\consumer
+PROJECT_ROOT = os.path.dirname(BASE_DIR)                       # ...\kafkaConsumer
+ENV_PATH = os.path.join(PROJECT_ROOT, ".env")
 LOG_DIR = os.path.join(BASE_DIR, "logs")
 ARCHIVE_DIR = os.path.join(LOG_DIR, "archive")
+
+# -----------------------------
+# Load environment variables
+# -----------------------------
+load_dotenv(ENV_PATH)
+
+INSTANCE_NAME = os.getenv("CONSUMER_INSTANCE_NAME", "lab_data_consumer")
 
 os.makedirs(LOG_DIR, exist_ok=True)
 os.makedirs(ARCHIVE_DIR, exist_ok=True)
 
 # -----------------------------
-# Log format
+# Logging Configuration
+# Changes:
+# 1. Rotate every hour
+# 2. Keep current logs in logs/ for 1 day
+# 3. Move older logs to logs/archive/
+# 4. Delete archived logs after 6 days
+# 5. Reduce noisy logs by using DEBUG for full payload
 # -----------------------------
 LOG_FORMAT = (
     "%(asctime)s | %(levelname)s | %(process)d | %(threadName)s | "
@@ -89,12 +52,9 @@ LOG_FORMAT = (
 )
 formatter = logging.Formatter(LOG_FORMAT)
 
-# -----------------------------
-# Main log - rotate hourly
-# keep 24 files in main folder
-# -----------------------------
+# Main log: rotate hourly, keep last 24 rotated files in main folder
 file_handler = TimedRotatingFileHandler(
-    filename=os.path.join(LOG_DIR, "consumer.log"),
+    filename=os.path.join(LOG_DIR, f"{INSTANCE_NAME}.log"),
     when="H",
     interval=1,
     backupCount=24,
@@ -104,12 +64,9 @@ file_handler.suffix = "%Y-%m-%d_%H.log"
 file_handler.setFormatter(formatter)
 file_handler.setLevel(logging.INFO)
 
-# -----------------------------
-# Error-only log - rotate hourly
-# keep 24 files in main folder
-# -----------------------------
+# Error-only log: rotate hourly, keep last 24 rotated files in main folder
 error_handler = TimedRotatingFileHandler(
-    filename=os.path.join(LOG_DIR, "consumer_error.log"),
+    filename=os.path.join(LOG_DIR, f"{INSTANCE_NAME}_error.log"),
     when="H",
     interval=1,
     backupCount=24,
@@ -119,9 +76,7 @@ error_handler.suffix = "%Y-%m-%d_%H.log"
 error_handler.setFormatter(formatter)
 error_handler.setLevel(logging.ERROR)
 
-# -----------------------------
-# Console log only if enabled
-# -----------------------------
+# Console handler is optional in production
 ENABLE_CONSOLE_LOG = os.getenv("ENABLE_CONSOLE_LOG", "false").lower() == "true"
 
 logger = logging.getLogger("KafkaConsumerService")
@@ -138,111 +93,168 @@ if ENABLE_CONSOLE_LOG:
 
 logger.propagate = False
 
-
-# smtp email config
-EMAIL_SENDER = os.getenv("EMAIL_SENDER")
-EMAIL_PASSWORD = os.getenv("EMAIL_PASSWORD")
-EMAIL_RECEIVER =os.getenv("EMAIL_RECEIVER")
-SMTP_SERVER = os.getenv("SMTP_SERVER")
-SMTP_PORT = os.getenv("SMTP_PORT")
-
-# Mapping of tables to their columns (excluding LogException)
+# -----------------------------
+# Tables handled by OLD consumer
+# IMPORTANT CHANGE:
+# dbo.Test_Parameters is REMOVED from old consumer
+# because it is handled by the new dedicated TP consumer
+# -----------------------------
 tables_columns = {
-    "dbo.Patient_Details": ['PatientMasterID', 'PatientID', 'PatientName', 'DOB', 'Gender', 'PatLocationID',
-                            'PatLocationName', 'CreateDate', 'ModifiedDate', 'LocationID', 'IsSync'],
-    "dbo.Orders": ['OrderID', 'PatientMasterID', 'BarcodeNo', 'BarcodeNoID', 'TestCode', 'Sampletype', 'SampleTypeID',
-                   'Samplecollectiontime', 'DbStatus', 'CreatedDate', 'ModifiedDate', 'LocationID', 'IsSync'],
-    "dbo.Test_Parameters": ['ResultID', 'OrderID', 'PatientMasterID', 'MacDataGuid', 'ParameterCode', 'TestCode',
-                            'Result', 'ResultType', 'DbStatus', 'CreatedDate', 'ResultReceivedDate', 'ResultUpdateDate',
-                            'ModifiedDate', 'MachineFID', 'LocationID', 'IsSync', 'InstrumentId'],
-    "dbo.ProductAuth_Table": ['AuthID', 'AuthKey', 'CreateDate', 'ModifiedDate', 'ExpTime', 'MacID', 'MachineName',
-                              'LocationID', 'IsSync'],
-    "dbo.Users": ['id', 'firstName', 'lastName', 'email', 'phoneNumber', 'location', 'role', 'userName',
-                  'confirmUserName', 'password', 'confirmPassword', 'createdDate', 'modifiedDate', 'IsDeleted',
-                  'IsActive', 'LocationID', 'IsSync'],
-    "dbo.ExtTestCodeConfiguration": ['ID', 'LISParamId', 'LISParamName', 'IsDeleted', 'CreateDate', 'ModifiedDate',
-                                     'LocationID', 'IsSync'],
-    "dbo.UtilityException": ['ID', 'MessageString', 'ErrorCode', 'Timestamp', 'MachineFID', 'BarcodeNo', 'ModifiedDate',
-                             'LocationID', 'IsSync'],
-    "dbo.LocationMaster": ['LocationID', 'LocationName', 'CreateDate', 'ModifiedDate', 'CenterId', 'IsSync'],
-    "dbo.KafkaBrokerStatus": ['ID', 'LocationID', 'logType', 'issync', 'created_at', 'updated_at', 'IsRunning'],
-    "dbo.AppVersionLog": ['Id', 'InstallationVersionNumber', 'InstallationSystemName', 'UserName', 'InstrumentName',
-                          'LocationName', 'CenterId', 'LogDate', 'BuildVersion', 'BuildDate', 'IsSync']
+    "dbo.Patient_Details": [
+        "PatientMasterID", "PatientID", "PatientName", "DOB", "Gender", "PatLocationID",
+        "PatLocationName", "CreateDate", "ModifiedDate", "LocationID", "IsSync"
+    ],
+    "dbo.Orders": [
+        "OrderID", "PatientMasterID", "BarcodeNo", "BarcodeNoID", "TestCode", "Sampletype",
+        "SampleTypeID", "Samplecollectiontime", "DbStatus", "CreatedDate", "ModifiedDate",
+        "LocationID", "IsSync"
+    ],
+
+    "dbo.ProductAuth_Table": [
+        "AuthID", "AuthKey", "CreateDate", "ModifiedDate", "ExpTime", "MacID", "MachineName",
+        "LocationID", "IsSync"
+    ],
+    "dbo.Users": [
+        "id", "firstName", "lastName", "email", "phoneNumber", "location", "role", "userName",
+        "confirmUserName", "password", "confirmPassword", "createdDate", "modifiedDate",
+        "IsDeleted", "IsActive", "LocationID", "IsSync"
+    ],
+    "dbo.ExtTestCodeConfiguration": [
+        "ID", "LISParamId", "LISParamName", "IsDeleted", "CreateDate", "ModifiedDate",
+        "LocationID", "IsSync"
+    ],
+    "dbo.UtilityException": [
+        "ID", "MessageString", "ErrorCode", "Timestamp", "MachineFID", "BarcodeNo",
+        "ModifiedDate", "LocationID", "IsSync"
+    ],
+    "dbo.LocationMaster": [
+        "LocationID", "LocationName", "CreateDate", "ModifiedDate", "CenterId", "IsSync"
+    ],
+    "dbo.KafkaBrokerStatus": [
+        "ID", "LocationID", "logType", "issync", "created_at", "updated_at", "IsRunning"
+    ],
+    "dbo.AppVersionLog": [
+        "Id", "InstallationVersionNumber", "InstallationSystemName", "UserName", "InstrumentName",
+        "LocationName", "CenterId", "LogDate", "BuildVersion", "BuildDate", "IsSync"
+    ]
 }
 
+# -----------------------------
+# Log management thread
+# Moves logs older than 1 day to archive
+# Deletes archived logs older than 6 days
+# -----------------------------
+def manage_logs():
+    while running:
+        try:
+            now = datetime.now()
 
-# Function to send emails
-def send_email(subject, body):
-    msg = MIMEText(body)
-    msg['Subject'] = subject
-    msg['From'] = EMAIL_SENDER
-    msg['To'] = EMAIL_RECEIVER
-    try:
-        with smtplib.SMTP(SMTP_SERVER, SMTP_PORT) as server:
-            server.starttls()
-            server.login(EMAIL_SENDER, EMAIL_PASSWORD)
-            server.send_message(msg)
-            logger.info(f"Email sent: {subject}")
-    except Exception as e:
-        logger.error(f"Failed to send email: {e}")
+            # Move old logs from main log folder to archive after 1 day
+            for fname in os.listdir(LOG_DIR):
+                if fname == "archive":
+                    continue
 
+                if not (
+                        fname.startswith(f"{INSTANCE_NAME}.log")
+                        or fname.startswith(f"{INSTANCE_NAME}_error.log")
+                ):
+                    continue
 
-# Signal handlers for graceful shutdown
+                fpath = os.path.join(LOG_DIR, fname)
+                if not os.path.isfile(fpath):
+                    continue
+
+                file_time = datetime.fromtimestamp(os.path.getmtime(fpath))
+                if now - file_time > timedelta(days=1):
+                    archive_path = os.path.join(ARCHIVE_DIR, fname)
+                    if not os.path.exists(archive_path):
+                        shutil.move(fpath, archive_path)
+
+            # Delete archived logs older than 6 days
+            for fname in os.listdir(ARCHIVE_DIR):
+                fpath = os.path.join(ARCHIVE_DIR, fname)
+                if not os.path.isfile(fpath):
+                    continue
+
+                file_time = datetime.fromtimestamp(os.path.getmtime(fpath))
+                if now - file_time > timedelta(days=6):
+                    os.remove(fpath)
+
+        except Exception as e:
+            logger.error(f"LOG MANAGEMENT ERROR | error={e}")
+
+        # Run once per hour
+        time.sleep(3600)
+
+# -----------------------------
+# Signal handlers
+# Changed:
+# graceful shutdown using running flag
+# no hard os._exit()
+# -----------------------------
 def handle_interrupt(signum, frame):
+    global running
     logger.info("Keyboard interrupt detected. Shutting down.")
-    send_email("Consumer Interrupted Alert",
-               "The consumer process has been interrupted. Please check the system status.")
-    # os._exit(0)  # Force exit to break retry loop
-
+    running = False
 
 def handle_shutdown(signum, frame):
+    global running
     logger.info("System is shutting down.")
-    send_email("Consumer Shutdown", "The system is shutting down. Check consumer status.")
-    #os._exit(0)  # Force exit to break retry loop
+    running = False
 
-# json management
-# def log_json_issues(record, table_name):
-#     """
-#     Log important JSON fields and any missing critical fields.
-#     """
-#     # Log DbStatus and Result
-#     db_status = record.get('DbStatus')
-#     result = record.get('Result')
-#     result_id = record.get('ResultID')
-#     logger.info(f"JSON Fields - DbStatus: {db_status},ResultID: {result_id}, Result: {result}, Table: {table_name}")
-#
-#     # Check for missing critical fields
-#     missing_fields = []
-#     for field in ['Result', 'ResultReceivedDate', 'CreatedDate']:
-#         if field not in record or record.get(field) in [None, '', 'null']:
-#             missing_fields.append(field)
-#
-#     if missing_fields:
-#         logger.warning(f"Missing fields in record {record.get('ResultID', record.get('OrderID', 'N/A'))}: {missing_fields}")
+# -----------------------------
+# JSON logging helper
+# Reduced noise:
+# only log useful info, no TP-specific warnings here
+# because TP is now handled by separate consumer
+# -----------------------------
+def log_json_issues(record, table_name):
+    if table_name == "dbo.Orders":
+        logger.debug(
+            f"JSON Fields | Table={table_name} | "
+            f"OrderID={record.get('OrderID')} | DbStatus={record.get('DbStatus')} | "
+            f"LocationID={record.get('LocationID')}"
+        )
+    elif table_name == "dbo.Patient_Details":
+        logger.debug(
+            f"JSON Fields | Table={table_name} | "
+            f"PatientMasterID={record.get('PatientMasterID')} | "
+            f"LocationID={record.get('LocationID')}"
+        )
+    elif table_name == "dbo.UtilityException":
+        logger.debug(
+            f"JSON Fields | Table={table_name} | "
+            f"ID={record.get('ID')} | ErrorCode={record.get('ErrorCode')} | "
+            f"LocationID={record.get('LocationID')}"
+        )
 
-
-
-
-# Process a single Kafka message
+# -----------------------------
+# Process one Kafka message
+# Important changes:
+# 1. TP removed from this old consumer
+# 2. LocationID validation fixed
+# 3. Skip logic changed from <= to <
+#    so same-status rows can still update
+# -----------------------------
 def process_message(cursor, message):
     record = message.value
-    logger.info(f"Processing message from {message.topic}")
     table_name = message.topic
 
-    # --- NEW: log JSON fields and missing critical fields ---
-    # log_json_issues(record, table_name)
-
+    logger.info(f"Processing message from {table_name}")
+    log_json_issues(record, table_name)
 
     columns = tables_columns.get(table_name)
     if not columns:
         logger.error(f"Unknown table: {table_name}")
         return False
 
-    # Date parsing logic
-    date_fields = ['CreatedDate', 'Createdate', 'createdDate', 'modifiedDate',
-                   'ModifiedDate', 'CreateDate', 'ResultReceivedDate',
-                   'ResultUpdateDate', 'Timestamp', 'Samplecollectiontime',
-                   'created_at', 'updated_at']
+    # Parse date strings into datetime objects
+    date_fields = [
+        "CreatedDate", "Createdate", "createdDate", "modifiedDate",
+        "ModifiedDate", "CreateDate", "Timestamp", "Samplecollectiontime",
+        "created_at", "updated_at", "DOB", "ExpTime", "LogDate", "BuildDate"
+    ]
+
     for key in date_fields:
         if key in record and isinstance(record[key], str):
             try:
@@ -250,51 +262,105 @@ def process_message(cursor, message):
             except (ValueError, TypeError):
                 record[key] = None
 
-    # Prepare database operation
     primary_key = columns[0]
-    location_id = record.get('LocationID')
-    if not location_id:
+    primary_key_value = record.get(primary_key)
+    location_id = record.get("LocationID")
+
+    if primary_key_value is None:
+        logger.error(f"Missing primary key '{primary_key}' in {table_name} record")
+        return False
+
+    # IMPORTANT CHANGE:
+    # use is None instead of if not location_id
+    if location_id is None:
         logger.error(f"Missing LocationID in {table_name} record")
         return False
 
     try:
-        if 'DbStatus' in columns:
-            cursor.execute(f"SELECT DbStatus FROM {table_name} WHERE {primary_key} = ? AND LocationID = ?",
-                           (record[primary_key], location_id))
-            result = cursor.fetchone()
-            if result:
-                current_db_status = result[0]
-                if record.get('DbStatus', 0) <= current_db_status:
-                    logger.info(f"Skipping outdated DbStatus update for {primary_key} {record[primary_key]}")
+        # Only skip if incoming DbStatus is LOWER than current
+        # Same-status rows are allowed to continue to update path
+        if "DbStatus" in columns:
+            cursor.execute(
+                f"SELECT DbStatus FROM {table_name} WHERE {primary_key} = ? AND LocationID = ?",
+                (primary_key_value, location_id)
+            )
+            existing = cursor.fetchone()
+
+            if existing:
+                current_db_status = existing[0] if existing[0] is not None else 0
+                incoming_db_status = record.get("DbStatus", 0) or 0
+
+                if incoming_db_status < current_db_status:
+                    logger.info(
+                        f"Skipping older DbStatus update | table={table_name} | "
+                        f"{primary_key}={primary_key_value} | "
+                        f"incoming={incoming_db_status} | existing={current_db_status}"
+                    )
                     return True
 
-        # Build update/insert query
-        placeholders = [record.get(col, None) for col in columns]
-        if cursor.execute(f"SELECT 1 FROM {table_name} WHERE {primary_key} = ? AND LocationID = ?",
-                          (record[primary_key], location_id)).fetchone():
-            update_cols = [f"{col} = ?" for col in columns if col != primary_key]
-            query = f"UPDATE {table_name} SET {', '.join(update_cols)} WHERE {primary_key} = ? AND LocationID = ?"
-            params = placeholders[1:] + [placeholders[0], location_id]
-        else:
-            query = f"INSERT INTO {table_name} ({', '.join(columns)}) VALUES ({', '.join(['?'] * len(columns))})"
-            params = placeholders
+        values = [record.get(col, None) for col in columns]
 
-        cursor.execute(query, params)
+        # Check if row exists
+        cursor.execute(
+            f"SELECT 1 FROM {table_name} WHERE {primary_key} = ? AND LocationID = ?",
+            (primary_key_value, location_id)
+        )
+        exists = cursor.fetchone()
+
+        if exists:
+            update_columns = [col for col in columns if col != primary_key]
+            update_assignments = ", ".join([f"{col} = ?" for col in update_columns])
+            query = (
+                f"UPDATE {table_name} "
+                f"SET {update_assignments} "
+                f"WHERE {primary_key} = ? AND LocationID = ?"
+            )
+            params = [record.get(col, None) for col in update_columns] + [primary_key_value, location_id]
+            cursor.execute(query, params)
+
+            logger.info(
+                f"UPDATED | table={table_name} | {primary_key}={primary_key_value} | LocationID={location_id}"
+            )
+        else:
+            query = (
+                f"INSERT INTO {table_name} ({', '.join(columns)}) "
+                f"VALUES ({', '.join(['?'] * len(columns))})"
+            )
+            cursor.execute(query, values)
+
+            logger.info(
+                f"INSERTED | table={table_name} | {primary_key}={primary_key_value} | LocationID={location_id}"
+            )
+
         return True
+
     except pyodbc.Error as e:
-        logger.error(f"Database error: {str(e)}")
-        raise  # Re-raise to trigger transaction rollback
+        logger.error(
+            f"DATABASE ERROR | table={table_name} | {primary_key}={primary_key_value} | "
+            f"LocationID={location_id} | error={e}"
+        )
+        raise
     except Exception as e:
-        logger.error(f"Processing error: {str(e)}")
+        logger.error(
+            f"PROCESSING ERROR | table={table_name} | {primary_key}={primary_key_value} | "
+            f"LocationID={location_id} | error={e}"
+        )
         return False
 
-
+# -----------------------------
+# Consume messages
+# Important changes:
+# 1. DB commit happens BEFORE Kafka offset commit
+# 2. Partition-wise offset commit
+# 3. No full JSON payload logging at INFO
+# -----------------------------
 def consume_messages(consumer_group_id):
     consumer = None
     conn = None
 
     try:
-        # Initialize database connection
+        logger.info("Opening central DB connection...")
+
         conn = pyodbc.connect(
             f"DRIVER={{{os.getenv('DB_DRIVER')}}};"
             f"SERVER={os.getenv('DB_SERVER')};"
@@ -305,80 +371,151 @@ def consume_messages(consumer_group_id):
             "TrustServerCertificate=yes;"
         )
         cursor = conn.cursor()
-        KAFKA_BOOTSTRAP_SERVERS = os.getenv("KAFKA_BOOTSTRAP_SERVERS")
-        # Initialize Kafka consumer (excluding LogException)
+
+        kafka_bootstrap_servers = os.getenv("KAFKA_BOOTSTRAP_SERVERS")
+
         consumer = KafkaConsumer(
             *tables_columns.keys(),
-            bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS,
-            value_deserializer=lambda x: json.loads(x.decode('utf-8')),
-            # api_version=(2,7),
+            bootstrap_servers=kafka_bootstrap_servers,
+            value_deserializer=lambda x: json.loads(x.decode("utf-8")),
             enable_auto_commit=False,
-            auto_offset_reset='latest',
+            auto_offset_reset="latest",
             group_id=consumer_group_id,
-            # max_poll_interval_ms=600000,
             session_timeout_ms=30000,
-            heartbeat_interval_ms=10000
+            heartbeat_interval_ms=10000,
+            max_poll_records=100,
+            request_timeout_ms=40000
         )
-        logger.info("Consumer initialized. Starting message processing...")
 
-        while True:
-            batch = consumer.poll(timeout_ms=10000, max_records=100)
+        logger.info("Old consumer initialized. Starting message processing...")
+
+        while running:
+            try:
+                batch = consumer.poll(timeout_ms=10000, max_records=100)
+            except KafkaError as e:
+                logger.error(f"POLL ERROR | error={e}")
+                raise
+            except Exception as e:
+                logger.error(f"UNEXPECTED POLL ERROR | error={e}")
+                raise
+
             if not batch:
                 continue
 
             try:
-                for topic_partition, messages in batch.items():
-                    for message in messages:
-                        logger.info("Received Message:\n %s",json.dumps(message.value,indent=4,default=str))
-                        success = process_message(cursor, message)
-                        if success:
-                            consumer.commit()
-                            logger.info(f"Message Values to commmitt {message.value}")
-                        else:
-                            logger.error(f"Failed to process message: {message.value}")
+                offsets_to_commit = {}
+                all_success = True
 
-                conn.commit()
+                for topic_partition, messages in batch.items():
+                    last_successful_offset = None
+
+                    for message in messages:
+                        record = message.value
+                        logger.debug(
+                            "Received Message: %s",
+                            json.dumps(record, indent=2, default=str)
+                        )
+
+                        success = process_message(cursor, message)
+
+                        if not success:
+                            logger.error(f"Failed to process message: {record}")
+                            all_success = False
+                            break
+
+                        last_successful_offset = message.offset
+
+                    if not all_success:
+                        break
+
+                    if last_successful_offset is not None:
+                        tp = TopicPartition(topic_partition.topic, topic_partition.partition)
+                        offsets_to_commit[tp] = OffsetAndMetadata(last_successful_offset + 1, None)
+
+                # IMPORTANT CHANGE:
+                # commit DB first
+                if all_success:
+                    conn.commit()
+                    logger.info("DB COMMIT SUCCESS")
+
+                    if offsets_to_commit:
+                        consumer.commit(offsets=offsets_to_commit)
+                        logger.info(
+                            f"OFFSET COMMIT SUCCESS | partitions={len(offsets_to_commit)}"
+                        )
+                else:
+                    conn.rollback()
+                    logger.error("BATCH FAILED | DB rolled back | offsets not committed")
+
             except (pyodbc.OperationalError, KafkaError) as e:
-                logger.error(f"Critical error during processing: {str(e)}")
+                logger.error(f"CRITICAL ERROR DURING PROCESSING | error={e}")
                 conn.rollback()
-                raise  # Trigger restart
+                raise
             except Exception as e:
-                logger.error(f"Unexpected error: {str(e)}")
+                logger.error(f"UNEXPECTED ERROR DURING PROCESSING | error={e}")
                 conn.rollback()
-                send_email("Consumer Processing Error", f"Error occurred: {str(e)}")
                 continue
+
     finally:
         logger.info("Cleaning up resources...")
-        if consumer:
-            consumer.close()
-        if conn:
-            conn.close()
+        try:
+            if consumer:
+                consumer.close()
+        except Exception:
+            pass
 
+        try:
+            if conn:
+                conn.close()
+        except Exception:
+            pass
+
+
+# -----------------------------
+# Main
+# -----------------------------
 if __name__ == "__main__":
-    #signal.signal(signal.SIGINT, handle_interrupt)
-    #signal.signal(signal.SIGTERM, handle_shutdown)
+    signal.signal(signal.SIGINT, handle_interrupt)
+    signal.signal(signal.SIGTERM, handle_shutdown)
 
+    # This old consumer continues to use the old group
     consumer_group_id = os.getenv("KAFKA_CONSUMER_GROUP")
-    logging.info(consumer_group_id)
+    logger.info(f"Using old consumer group: {consumer_group_id}")
+
+    # Start log management thread
+    log_manager_thread = threading.Thread(
+        target=manage_logs,
+        name="LogManager",
+        daemon=True
+    )
+    log_manager_thread.start()
+
     retry_count = 0
     max_retry_delay = 300  # 5 minutes
 
-    while True:
+    while running:
         try:
-            logger.info(f"Starting consumer (attempt {retry_count + 1})...")
+            logger.info(f"Starting old consumer (attempt {retry_count + 1})...")
             consume_messages(consumer_group_id)
+            retry_count = 0
+
         except (NoBrokersAvailable, CommitFailedError, pyodbc.OperationalError) as e:
-            logger.error(f"Connection error: {str(e)}")
+            logger.error(f"CONNECTION ERROR | error={e}")
             delay = min(10 * (2 ** retry_count), max_retry_delay)
             retry_count += 1
+
         except KafkaError as e:
-            logger.error(f"Kafka error: {str(e)}")
+            logger.error(f"KAFKA ERROR | error={e}")
             delay = 15
             retry_count = 0
+
         except Exception as e:
-            logger.error(f"Unexpected error: {str(e)}")
+            logger.error(f"UNEXPECTED TOP-LEVEL ERROR | error={e}")
             delay = 30
             retry_count += 1
 
-        logger.info(f"Restarting in {delay} seconds...")
-        time.sleep(delay)
+        if running:
+            logger.info(f"Restarting in {delay} seconds...")
+            time.sleep(delay)
+
+    logger.info("Old consumer stopped gracefully.")
