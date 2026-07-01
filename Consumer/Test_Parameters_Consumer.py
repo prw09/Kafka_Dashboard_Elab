@@ -7,6 +7,7 @@ import random
 import threading
 from datetime import datetime
 
+
 import pyodbc
 from dotenv import load_dotenv
 from kafka import KafkaConsumer
